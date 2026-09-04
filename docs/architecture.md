@@ -32,9 +32,11 @@ client ──GET /api/runs/{run_id}/stream──▶ traefik ──▶ conversati
 
 agent worker (Kafka consumer of runs.requested):
   PATCH run running → GET run context (history, study, concept sheet)
-  loop: Claude stream ──▶ events (text.delta, thinking.delta, tool.call, tool.result, citation, concept_sheet.updated)
-        tools: search_documents (documents /search), update_concept_sheet (conversations), ClinicalTrials.gov MCP tools
-  POST assistant message, PATCH run completed + usage, POST usage → financials
+  LangGraph: orchestrate (plan event) ──▶ subagents in parallel waves ──▶ synthesize   (docs/agent-orchestration.md)
+        each subagent: Claude stream ──▶ events tagged subagent_id (text.delta, thinking.delta, tool.call, tool.result,
+        concept_sheet.updated, subagent.started/completed); tools: search_documents (documents /search),
+        update_concept_sheet (conversations), ClinicalTrials.gov MCP tools
+  POST assistant message (+ citations), PATCH run completed + usage, POST usage → financials
 ```
 
 Events are batched by the agent (text deltas coalesced, flushed every ~150 ms) and appended with a per-run sequence number. The SSE endpoint polls the table (250 ms) and emits `id: <seq>` so reconnects resume exactly.
