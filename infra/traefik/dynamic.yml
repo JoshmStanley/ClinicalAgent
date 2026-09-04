@@ -39,6 +39,8 @@ http:
     auth:
       forwardAuth:
         address: http://identity:8001/auth/verify
+        trustForwardHeader: false      # strip client-supplied X-Forwarded-* headers
+        maxResponseBodySize: 65536     # verify answers with headers only
         authResponseHeaders:
           - X-Internal-Token
           - X-Principal-User
