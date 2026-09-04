@@ -6,13 +6,13 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from svix.webhooks import Webhook, WebhookVerificationError
 
-from clinical_common.auth import Principal, principal_dependency, require_admin
+from clinical_common.auth import Principal, principal_dependency, principal_from_edge, require_admin
 from clinical_common.db import Base, Database
 from clinical_common.logging import configure_logging
 from identity.models import Membership, Org, User
@@ -64,6 +64,21 @@ class MeOut(BaseModel):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/auth/verify")
+@app.api_route("/auth/verify", methods=["POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"], include_in_schema=False)
+async def auth_verify(request: Request, settings: Settings = Depends(get_settings)):
+    """Traefik ForwardAuth target.
+
+    Traefik calls this with the original request's headers. A 2xx lets the
+    request through and the headers listed in Traefik's `authResponseHeaders`
+    are copied onto the upstream request; anything else is returned to the
+    client as-is. We always set all four principal headers so a client can
+    never smuggle its own.
+    """
+    principal = principal_from_edge(request, settings)
+    return Response(status_code=204, headers=principal.internal_headers(settings.internal_token))
 
 
 @app.get("/me", response_model=MeOut)

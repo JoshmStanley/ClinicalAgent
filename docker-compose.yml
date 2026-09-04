@@ -82,14 +82,29 @@ services:
       timeout: 3s
       retries: 20
 
-  # ------------------------------------------------------------- services
-  gateway:
-    build: {context: ., args: {PACKAGE: gateway}}
-    command: uvicorn gateway.main:app --host 0.0.0.0 --port 8000
-    environment: {<<: *service-env, SERVICE_NAME: gateway}
-    ports: ["8000:8000"]
+  # ------------------------------------------------------------------ edge
+  # Traefik is the API gateway: routing, ForwardAuth (-> identity /auth/verify),
+  # per-org rate limiting, CORS, load balancing. Dynamic config lives in
+  # infra/traefik/dynamic.yml (hot-reloaded); on Kubernetes it becomes CRDs.
+  traefik:
+    image: traefik:v3.3
+    command:
+      - --providers.file.filename=/etc/traefik/dynamic.yml
+      - --providers.file.watch=true
+      - --entrypoints.web.address=:8000
+      - --api.dashboard=true
+      - --api.insecure=true            # dashboard on :8080, local only
+      - --accesslog=true
+      - --log.level=INFO
+    environment:
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-120}
+      RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-40}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+    ports: ["8000:8000", "8080:8080"]
+    volumes: ["./infra/traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro"]
     depends_on: [identity, conversations, financials, documents]
 
+  # ------------------------------------------------------------- services
   identity:
     build: {context: ., args: {PACKAGE: identity}}
     command: uvicorn identity.main:app --host 0.0.0.0 --port 8001
