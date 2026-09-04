@@ -1,0 +1,20 @@
+[project]
+name = "conversations"
+version = "0.1.0"
+description = "Programs, studies, concept sheets, conversations, runs and the run event log"
+requires-python = ">=3.12"
+dependencies = [
+    "clinical-common",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+]
+
+[tool.uv.sources]
+clinical-common = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/conversations"]

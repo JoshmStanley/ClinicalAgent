@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  push:
+    branches: [main, dev, sandbox]
+  pull_request:
+    branches: [main, dev, sandbox]
+
+jobs:
+  ci:
+    name: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv python install 3.12
+      - run: uv sync --all-packages --frozen
+      - run: uv run ruff format --check .
+      - run: uv run ruff check .
+      - run: uv run pytest -q
+
+  docker-build:
+    name: docker build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build --build-arg PACKAGE=gateway -t clinicalagent-gateway .

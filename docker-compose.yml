@@ -1,0 +1,191 @@
+x-service-env: &service-env
+  ENVIRONMENT: local
+  AUTH_MODE: ${AUTH_MODE:-dev}
+  INTERNAL_TOKEN: ${INTERNAL_TOKEN:-dev-internal-token}
+  CLERK_JWKS_URL: ${CLERK_JWKS_URL:-}
+  CLERK_ISSUER: ${CLERK_ISSUER:-}
+  KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+  OPENSEARCH_URL: http://opensearch:9200
+  S3_ENDPOINT_URL: http://minio:9000
+  S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+  S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+  S3_BUCKET: clinical-documents
+  EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-fake}
+  VOYAGE_API_KEY: ${VOYAGE_API_KEY:-}
+  IDENTITY_URL: http://identity:8001
+  CONVERSATIONS_URL: http://conversations:8002
+  AGENT_URL: http://agent:8003
+  FINANCIALS_URL: http://financials:8004
+  DOCUMENTS_URL: http://documents:8005
+  CLINICALTRIALS_MCP_URL: http://clinicaltrials-mcp:8010/mcp
+
+services:
+  # ---------------------------------------------------------------- infra
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports: ["5432:5432"]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  opensearch:
+    image: opensearchproject/opensearch:2.17.1
+    environment:
+      discovery.type: single-node
+      DISABLE_SECURITY_PLUGIN: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports: ["9200:9200"]
+    volumes: [opensearch-data:/usr/share/opensearch/data]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda start
+      - --smp 1
+      - --overprovisioned
+      - --memory 512M
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+    ports: ["19092:19092"]
+    volumes: [redpanda-data:/var/lib/redpanda/data]
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  minio:
+    image: minio/minio:RELEASE.2024-10-13T13-34-11Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports: ["9000:9000", "9001:9001"]
+    volumes: [minio-data:/data]
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || curl -sf http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # ------------------------------------------------------------- services
+  gateway:
+    build: {context: ., args: {PACKAGE: gateway}}
+    command: uvicorn gateway.main:app --host 0.0.0.0 --port 8000
+    environment: {<<: *service-env, SERVICE_NAME: gateway}
+    ports: ["8000:8000"]
+    depends_on: [identity, conversations, financials, documents]
+
+  identity:
+    build: {context: ., args: {PACKAGE: identity}}
+    command: uvicorn identity.main:app --host 0.0.0.0 --port 8001
+    environment:
+      <<: *service-env
+      SERVICE_NAME: identity
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/identity
+      CLERK_WEBHOOK_SECRET: ${CLERK_WEBHOOK_SECRET:-}
+    ports: ["8001:8001"]
+    depends_on: {postgres: {condition: service_healthy}}
+
+  conversations:
+    build: {context: ., args: {PACKAGE: conversations}}
+    command: uvicorn conversations.main:app --host 0.0.0.0 --port 8002
+    environment:
+      <<: *service-env
+      SERVICE_NAME: conversations
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/conversations
+    ports: ["8002:8002"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redpanda: {condition: service_healthy}
+
+  agent:
+    build: {context: ., args: {PACKAGE: agent}}
+    command: python -m agent.worker
+    environment:
+      <<: *service-env
+      SERVICE_NAME: agent
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      AGENT_MODEL: ${AGENT_MODEL:-claude-opus-5}
+      AGENT_EFFORT: ${AGENT_EFFORT:-medium}
+    depends_on:
+      redpanda: {condition: service_healthy}
+      conversations: {condition: service_started}
+      documents: {condition: service_started}
+
+  financials:
+    build: {context: ., args: {PACKAGE: financials}}
+    command: uvicorn financials.main:app --host 0.0.0.0 --port 8004
+    environment:
+      <<: *service-env
+      SERVICE_NAME: financials
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/financials
+    ports: ["8004:8004"]
+    depends_on: {postgres: {condition: service_healthy}}
+
+  documents:
+    build: {context: ., args: {PACKAGE: documents}}
+    command: uvicorn documents.main:app --host 0.0.0.0 --port 8005
+    environment:
+      <<: *service-env
+      SERVICE_NAME: documents
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/documents
+    ports: ["8005:8005"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redpanda: {condition: service_healthy}
+      minio: {condition: service_healthy}
+      opensearch: {condition: service_healthy}
+
+  ingestion-converter:
+    build: {context: ., args: {PACKAGE: ingestion}}
+    command: python -m ingestion.worker converter
+    environment: {<<: *service-env, SERVICE_NAME: ingestion-converter}
+    depends_on: {redpanda: {condition: service_healthy}, minio: {condition: service_healthy}}
+
+  ingestion-sections:
+    build: {context: ., args: {PACKAGE: ingestion}}
+    command: python -m ingestion.worker sections
+    environment: {<<: *service-env, SERVICE_NAME: ingestion-sections}
+    depends_on: {redpanda: {condition: service_healthy}, minio: {condition: service_healthy}}
+
+  ingestion-chunker:
+    build: {context: ., args: {PACKAGE: ingestion}}
+    command: python -m ingestion.worker chunker
+    environment: {<<: *service-env, SERVICE_NAME: ingestion-chunker}
+    depends_on: {redpanda: {condition: service_healthy}, minio: {condition: service_healthy}}
+
+  ingestion-embed:
+    build: {context: ., args: {PACKAGE: ingestion}}
+    command: python -m ingestion.worker embed
+    environment: {<<: *service-env, SERVICE_NAME: ingestion-embed}
+    depends_on:
+      redpanda: {condition: service_healthy}
+      minio: {condition: service_healthy}
+      opensearch: {condition: service_healthy}
+
+  clinicaltrials-mcp:
+    build: {context: ., args: {PACKAGE: clinicaltrials-mcp}}
+    command: python -m clinicaltrials_mcp.server
+    environment: {<<: *service-env, SERVICE_NAME: clinicaltrials-mcp}
+    ports: ["8010:8010"]
+
+volumes:
+  postgres-data:
+  opensearch-data:
+  redpanda-data:
+  minio-data:
