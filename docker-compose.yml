@@ -87,7 +87,7 @@ services:
   # per-org rate limiting, CORS, load balancing. Dynamic config lives in
   # infra/traefik/dynamic.yml (hot-reloaded); on Kubernetes it becomes CRDs.
   traefik:
-    image: traefik:v3.3
+    image: traefik:v3
     command:
       - --providers.file.filename=/etc/traefik/dynamic.yml
       - --providers.file.watch=true
