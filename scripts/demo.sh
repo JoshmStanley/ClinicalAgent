@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end local demo through the gateway using dev-mode auth headers.
+# End-to-end local demo through Traefik (:8000) using dev-mode auth headers.
 # Requires: `make up` (all services running) and curl + jq.
 set -euo pipefail
 

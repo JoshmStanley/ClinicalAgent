@@ -104,3 +104,16 @@ class RunEvent(Base):
     type: Mapped[str] = mapped_column(String)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class RunEventBatch(Base):
+    """Receipt for an event batch, committed atomically with its events.
+
+    A sender can retry after a lost HTTP response without duplicating text.
+    """
+
+    __tablename__ = "run_event_batches"
+    run_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), primary_key=True)
+    batch_id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True)
+    payload_hash: Mapped[str] = mapped_column(String(64))
+    last_seq: Mapped[int] = mapped_column(Integer)

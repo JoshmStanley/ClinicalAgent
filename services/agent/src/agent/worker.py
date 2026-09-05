@@ -11,12 +11,14 @@ from agent.settings import get_settings
 from clinical_common.events import RunRequested
 from clinical_common.kafka import Topics, consume_forever
 from clinical_common.logging import configure_logging
+from clinical_common.telemetry import configure_telemetry
 
 log = logging.getLogger(__name__)
 
 
 async def main() -> None:
     settings = get_settings()
+    configure_telemetry(settings.service_name, settings)
     configure_logging(settings.log_level, settings.service_name)
     executor = RunExecutor(settings)
 

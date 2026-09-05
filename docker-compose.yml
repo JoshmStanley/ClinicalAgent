@@ -3,6 +3,7 @@ x-service-env: &service-env
   AUTH_MODE: ${AUTH_MODE:-dev}
   INTERNAL_TOKEN: ${INTERNAL_TOKEN:-dev-internal-token}
   CLERK_JWKS_URL: ${CLERK_JWKS_URL:-}
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
   CLERK_ISSUER: ${CLERK_ISSUER:-}
   KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
   OPENSEARCH_URL: http://opensearch:9200
@@ -26,7 +27,7 @@ services:
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-    ports: ["5432:5432"]
+    ports: ["127.0.0.1:5432:5432"]
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
@@ -43,7 +44,7 @@ services:
       DISABLE_SECURITY_PLUGIN: "true"
       DISABLE_INSTALL_DEMO_CONFIG: "true"
       OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
-    ports: ["9200:9200"]
+    ports: ["127.0.0.1:9200:9200"]
     volumes: [opensearch-data:/usr/share/opensearch/data]
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
@@ -60,7 +61,7 @@ services:
       - --memory 512M
       - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
       - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
-    ports: ["19092:19092"]
+    ports: ["127.0.0.1:19092:19092"]
     volumes: [redpanda-data:/var/lib/redpanda/data]
     healthcheck:
       test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
@@ -74,7 +75,7 @@ services:
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
-    ports: ["9000:9000", "9001:9001"]
+    ports: ["127.0.0.1:9000:9000", "127.0.0.1:9001:9001"]
     volumes: [minio-data:/data]
     healthcheck:
       test: ["CMD-SHELL", "mc ready local || curl -sf http://localhost:9000/minio/health/live"]
@@ -82,14 +83,29 @@ services:
       timeout: 3s
       retries: 20
 
-  # ------------------------------------------------------------- services
-  gateway:
-    build: {context: ., args: {PACKAGE: gateway}}
-    command: uvicorn gateway.main:app --host 0.0.0.0 --port 8000
-    environment: {<<: *service-env, SERVICE_NAME: gateway}
-    ports: ["8000:8000"]
+  # ------------------------------------------------------------------ edge
+  # Traefik is the API gateway: routing, ForwardAuth (-> identity /auth/verify),
+  # per-org rate limiting, CORS, load balancing. Dynamic config lives in
+  # infra/traefik/dynamic.yml (hot-reloaded); on Kubernetes it becomes CRDs.
+  traefik:
+    image: traefik:v3
+    command:
+      - --providers.file.filename=/etc/traefik/dynamic.yml
+      - --providers.file.watch=true
+      - --entrypoints.web.address=:8000
+      - --api.dashboard=true
+      - --api.insecure=true            # dashboard on :8080, local only
+      - --accesslog=true
+      - --log.level=INFO
+    environment:
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-120}
+      RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-40}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+    ports: ["8000:8000", "127.0.0.1:8080:8080"]
+    volumes: ["./infra/traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro"]
     depends_on: [identity, conversations, financials, documents]
 
+  # ------------------------------------------------------------- services
   identity:
     build: {context: ., args: {PACKAGE: identity}}
     command: uvicorn identity.main:app --host 0.0.0.0 --port 8001
@@ -98,7 +114,6 @@ services:
       SERVICE_NAME: identity
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/identity
       CLERK_WEBHOOK_SECRET: ${CLERK_WEBHOOK_SECRET:-}
-    ports: ["8001:8001"]
     depends_on: {postgres: {condition: service_healthy}}
 
   conversations:
@@ -108,7 +123,6 @@ services:
       <<: *service-env
       SERVICE_NAME: conversations
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/conversations
-    ports: ["8002:8002"]
     depends_on:
       postgres: {condition: service_healthy}
       redpanda: {condition: service_healthy}
@@ -119,9 +133,20 @@ services:
     environment:
       <<: *service-env
       SERVICE_NAME: agent
+      USAGE_WRITER_TOKEN: ${USAGE_WRITER_TOKEN:-dev-usage-writer-token}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-https://cloud.langfuse.com}
+      AGENT_MAX_PARALLEL: ${AGENT_MAX_PARALLEL:-4}
+      AGENT_MAX_TOTAL_AGENTS: ${AGENT_MAX_TOTAL_AGENTS:-12}
       AGENT_MODEL: ${AGENT_MODEL:-claude-opus-5}
       AGENT_EFFORT: ${AGENT_EFFORT:-medium}
+      ORCHESTRATOR_MAX_DEPTH: ${ORCHESTRATOR_MAX_DEPTH:-2}
+      ORCHESTRATOR_MAX_SUBAGENTS: ${ORCHESTRATOR_MAX_SUBAGENTS:-5}
+      SUBAGENT_EFFORT: ${SUBAGENT_EFFORT:-low}
+      SUBAGENT_MAX_ITERATIONS: ${SUBAGENT_MAX_ITERATIONS:-8}
+      SIMPLE_MODE: ${SIMPLE_MODE:-true}
     depends_on:
       redpanda: {condition: service_healthy}
       conversations: {condition: service_started}
@@ -133,8 +158,8 @@ services:
     environment:
       <<: *service-env
       SERVICE_NAME: financials
+      USAGE_WRITER_TOKEN: ${USAGE_WRITER_TOKEN:-dev-usage-writer-token}
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/financials
-    ports: ["8004:8004"]
     depends_on: {postgres: {condition: service_healthy}}
 
   documents:
@@ -144,7 +169,6 @@ services:
       <<: *service-env
       SERVICE_NAME: documents
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/documents
-    ports: ["8005:8005"]
     depends_on:
       postgres: {condition: service_healthy}
       redpanda: {condition: service_healthy}
@@ -182,7 +206,19 @@ services:
     build: {context: ., args: {PACKAGE: clinicaltrials-mcp}}
     command: python -m clinicaltrials_mcp.server
     environment: {<<: *service-env, SERVICE_NAME: clinicaltrials-mcp}
-    ports: ["8010:8010"]
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.135.0
+    profiles: [observability]
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes: ["./infra/otel/collector.yml:/etc/otelcol-contrib/config.yaml:ro"]
+    ports: ["127.0.0.1:4317:4317", "127.0.0.1:4318:4318"]   # published so `make run-<service>` can export too
+    depends_on: [jaeger]
+
+  jaeger:
+    image: jaegertracing/jaeger:2.11.0
+    profiles: [observability]
+    ports: ["127.0.0.1:16686:16686"]
 
 volumes:
   postgres-data:

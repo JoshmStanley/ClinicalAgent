@@ -15,6 +15,8 @@ from sqlalchemy import DateTime, MetaData
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from clinical_common.telemetry import instrument_engine
+
 
 def utcnow() -> datetime:
     return datetime.now(UTC)
@@ -43,6 +45,7 @@ class TimestampMixin:
 class Database:
     def __init__(self, url: str) -> None:
         self.engine = create_async_engine(url, pool_pre_ping=True)
+        instrument_engine(self.engine)
         self.session_factory = async_sessionmaker(self.engine, expire_on_commit=False)
 
     async def create_all(self, base: type[DeclarativeBase]) -> None:
