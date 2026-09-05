@@ -13,7 +13,8 @@ import anthropic
 import httpx
 
 from agent.graph import RunContext, run_orchestration
-from agent.llm import CITE_RE
+from agent.llm import CITE_RE, active_trace
+from agent.observability import run_trace
 from agent.settings import Settings
 from agent.tools import ToolBox
 from clinical_common.auth import Principal
@@ -203,5 +204,24 @@ class RunExecutor:
             history=build_messages(ctx["messages"]),
             study_block=study_context_block(ctx),
         )
-        text = await run_orchestration(rc)
+        request = RunRequested(
+            run_id=ctx["run"]["id"],
+            conversation_id=ctx["conversation"]["id"],
+            user_id=tools.principal.user_id,
+            org_id=tools.principal.org_id,
+            role=tools.principal.role,
+        )
+        async with run_trace(
+            self.settings,
+            request,
+            study_id=ctx["conversation"].get("study_id"),
+            model=self.settings.agent_model,
+            question=rc.history[-1]["content"] if rc.history else None,
+        ) as rt:
+            token = active_trace.set(rt)
+            try:
+                text = await run_orchestration(rc)
+                rt.complete(text, rc.usage.total)
+            finally:
+                active_trace.reset(token)
         return text, resolve_citations(text, tools, sink), rc.usage.total

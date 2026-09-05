@@ -27,6 +27,7 @@ from clinical_common.events import RunEvent as RunEventIn
 from clinical_common.events import RunRequested
 from clinical_common.kafka import JsonProducer, Topics
 from clinical_common.logging import configure_logging
+from clinical_common.telemetry import configure_telemetry, instrument_app, shutdown_telemetry
 from conversations.models import (
     RUN_QUEUED,
     RUN_TERMINAL,
@@ -75,18 +76,21 @@ state = State()
 async def lifespan(app: FastAPI):
     settings = get_settings()
     configure_logging(settings.log_level, settings.service_name)
+    configure_telemetry(settings.service_name, settings)
     state.db = Database(settings.database_url)
     await state.db.create_all(Base)
     state.producer = JsonProducer(settings.kafka_bootstrap_servers)
     await state.producer.start()
     state.http = httpx.AsyncClient(timeout=10.0)
     yield
+    shutdown_telemetry()
     await state.http.aclose()
     await state.producer.stop()
     await state.db.dispose()
 
 
 app = FastAPI(title="conversations", lifespan=lifespan)
+instrument_app(app)
 get_principal = principal_dependency(get_settings)
 
 

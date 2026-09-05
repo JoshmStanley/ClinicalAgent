@@ -14,6 +14,7 @@ Runtime objects (client, tools, event sink, usage meter) travel in `config["conf
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -23,6 +24,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Send
+from opentelemetry import trace
 
 from agent.llm import CITE_RE, Emitter, ScopedEmitter, UsageMeter, call_model, run_tool, text_of
 from agent.plan import Plan, SubagentResult, SubagentTask, parse_plan, plan_schema, ready_tasks
@@ -43,9 +45,11 @@ class RunContext:
     history: list[dict[str, Any]]  # conversation so far, last message is the user's request
     study_block: str
     usage: UsageMeter = field(init=False)
+    limits: Any = field(init=False)
 
     def __post_init__(self) -> None:
         self.usage = UsageMeter(self.settings.agent_model)
+        self.limits = {"spawned": 0, "writer": None, "parallel": asyncio.Semaphore(self.settings.agent_max_parallel)}
 
     def system(self, *extra: str) -> list[dict[str, Any]]:
         blocks = [
@@ -58,6 +62,18 @@ class RunContext:
     @property
     def tool_names(self) -> list[str]:
         return [d["name"] for d in self.tools.definitions]
+
+
+class ScopedTools:
+    def __init__(self, tools, allowed):
+        self.parent = tools
+        self.definitions = [d for d in tools.definitions if d["name"] in allowed]
+        self.seen_chunks = tools.seen_chunks
+
+    async def execute(self, name, args):
+        if name not in {d["name"] for d in self.definitions}:
+            raise PermissionError(f"Tool {name} is not assigned to this task")
+        return await self.parent.execute(name, args)
 
 
 def _merge(a: dict[str, SubagentResult] | None, b: dict[str, SubagentResult] | None) -> dict[str, SubagentResult]:
@@ -127,6 +143,11 @@ def _level_messages(ctx: RunContext, state: OrchestratorState) -> list[dict[str,
 # --- nodes -------------------------------------------------------------------
 
 
+async def bounded_model(ctx, *args, **kwargs):
+    async with ctx.limits["parallel"]:
+        return await call_model(*args, **kwargs)
+
+
 async def orchestrate(state: OrchestratorState, config: RunnableConfig) -> dict[str, Any]:
     ctx, s = _ctx(config), _ctx(config).settings
     sink = _scope(ctx, state)
@@ -134,7 +155,8 @@ async def orchestrate(state: OrchestratorState, config: RunnableConfig) -> dict[
     can_nest = depth + 1 < s.orchestrator_max_depth
     allow_answer = s.simple_mode
     tool_lines = [f"{d['name']}: {d.get('description', '').split('. ')[0]}" for d in ctx.tools.definitions]
-    final = await call_model(
+    final = await bounded_model(
+        ctx,
         ctx.client,
         model=s.agent_model,
         system=ctx.system(orchestrator_prompt(tool_lines, s.orchestrator_max_subagents, can_nest, allow_answer)),
@@ -185,8 +207,36 @@ def dispatch(state: OrchestratorState) -> list[Send] | str:
 
 
 async def subagent(payload: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
-    ctx = _ctx(config)
+    task = payload["task"]
+    with trace.get_tracer("agent.graph").start_as_current_span(
+        "agent.task",
+        attributes={
+            "agent.id": task.subagent_id,
+            "agent.name": task.name,
+            "agent.type": task.type,
+            "agent.depth": payload["depth"] + 1,
+        },
+    ):
+        return await _subagent(payload, config)
+
+
+async def _subagent(payload: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
+    ctx = copy.copy(_ctx(config))
     task: SubagentTask = payload["task"]
+    if ctx.limits["spawned"] >= ctx.settings.agent_max_total_agents:
+        return {
+            "results": {
+                task.name: SubagentResult(
+                    name=task.name,
+                    subagent_id=task.subagent_id,
+                    type=task.type,
+                    ok=False,
+                    error="Run-wide agent limit reached; task was not executed",
+                )
+            }
+        }
+    ctx.limits["spawned"] += 1
+    ctx.tools = ScopedTools(ctx.tools, set(task.tools))
     depth: int = payload["depth"] + 1
     inputs: dict[str, SubagentResult] = payload["inputs"]
     sink = ScopedEmitter(ctx.sink, subagent_id=task.subagent_id, subagent_name=task.name)
@@ -205,7 +255,8 @@ async def subagent(payload: dict[str, Any], config: RunnableConfig) -> dict[str,
         if nested:
             result = await run_nested(ctx, task, inputs, depth)
         else:
-            result = await run_worker(ctx, task, inputs, sink)
+            async with ctx.limits["parallel"]:
+                result = await run_worker(ctx, task, inputs, sink)
     except Exception as exc:
         log.exception("subagent %s failed", task.name)
         result = SubagentResult(name=task.name, subagent_id=task.subagent_id, type=task.type, ok=False, error=str(exc))
@@ -243,7 +294,8 @@ async def synthesize(state: OrchestratorState, config: RunnableConfig) -> dict[s
             body = f"FAILED: {r.error}"
         parts.append(f"### {t.name} ({t.type})\nObjective: {t.objective}\n\n{body}")
     messages = _level_messages(ctx, state) + [{"role": "user", "content": "\n\n".join(parts)}]
-    final = await call_model(
+    final = await bounded_model(
+        ctx,
         ctx.client,
         model=s.agent_model,
         system=ctx.system(SYNTHESIZER_PROMPT),
@@ -264,6 +316,12 @@ async def run_worker(ctx: RunContext, task: SubagentTask, inputs: dict[str, Suba
     model must answer."""
     s = ctx.settings
     allowed = set(task.tools)
+    if "update_concept_sheet" in allowed:
+        if ctx.limits["writer"] is None:
+            ctx.limits["writer"] = task.subagent_id
+        elif ctx.limits["writer"] != task.subagent_id:
+            allowed.remove("update_concept_sheet")
+    ctx.tools = ScopedTools(ctx.tools, allowed)
     tool_defs = [d for d in ctx.tools.definitions if d["name"] in allowed]
     effort = task.effort or s.subagent_effort
     system = ctx.system(subagent_prompt(task.name, task.objective, [d["name"] for d in tool_defs], effort))

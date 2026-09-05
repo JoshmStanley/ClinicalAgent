@@ -113,6 +113,7 @@ class FakeClient:
 
 
 class FakeTools:
+    principal = NS(user_id="u", org_id="o", role="org:member")
     definitions = [SEARCH_DOCUMENTS, UPDATE_CONCEPT_SHEET, SEARCH_STUDIES]
 
     def __init__(self):
@@ -147,7 +148,8 @@ def last_user_text(kw) -> str:
 
 
 CTX = {
-    "conversation": {"study_id": "s1"},
+    "run": {"id": "00000000-0000-0000-0000-000000000001"},
+    "conversation": {"id": "c1", "study_id": "s1"},
     "study": {"name": "XYZ-201", "phase": "2", "indication": "NSCLC", "status": "planning"},
     "concept_sheet": None,
     "messages": [{"role": "user", "text": "Research eligibility criteria and draft a proposal."}],
@@ -410,3 +412,42 @@ def test_event_sink_coalesces_deltas_per_subagent_track():
         ("b", "world"),
         (None, "top-level"),
     ]
+
+
+async def test_run_wide_agent_and_parallel_caps():
+    def respond(kind, name, kw):
+        if kind == "plan":
+            return msg(plan_json([task(f"work{i}") for i in range(5)]))
+        return msg("done")
+
+    result = await run(respond, agent_max_total_agents=2, agent_max_parallel=1)
+    assert len(result.client.calls_of("worker")) == 2
+    assert result.client.max_active == 1
+
+
+async def test_nested_cannot_reacquire_unassigned_write_tool():
+    def respond(kind, name, kw):
+        if kind == "plan":
+            if "coordinate this sub-task" not in last_user_text(kw):
+                return msg(plan_json([task("research", type_="orchestrator", tools=["search_documents"])]))
+            return msg(plan_json([task("child", tools=["update_concept_sheet"])]))
+        if kind == "worker":
+            return msg("invalid call", tool_uses=[("update_concept_sheet", {"content": {}})])
+        return msg("done")
+
+    result = await run(respond, subagent_max_iterations=1)
+    assert result.tools.calls == []
+
+
+async def test_only_one_worker_can_write_concept_sheet():
+    def respond(kind, name, kw):
+        if kind == "plan":
+            return msg(
+                plan_json([task("a", tools=["update_concept_sheet"]), task("b", tools=["update_concept_sheet"])])
+            )
+        if kind == "worker" and not any(m["role"] == "assistant" for m in kw["messages"]):
+            return msg("write", tool_uses=[("update_concept_sheet", {"content": {}})])
+        return msg("done")
+
+    result = await run(respond)
+    assert len([name for name, _ in result.tools.calls if name == "update_concept_sheet"]) == 1

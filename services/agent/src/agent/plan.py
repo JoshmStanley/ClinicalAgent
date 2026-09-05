@@ -104,18 +104,24 @@ def parse_plan(raw: str | dict[str, Any], *, tool_names: list[str], max_tasks: i
     if len(plan.tasks) > max_tasks:
         log.warning("plan had %d tasks; keeping the first %d", len(plan.tasks), max_tasks)
     seen: set[str] = set()
+    names = {}
     for t in tasks:
         base = "".join(c if c.isalnum() or c == "_" else "_" for c in t.name.strip().lower()) or "task"
         name, n = base, 2
         while name in seen:
             name, n = f"{base}_{n}", n + 1
+        names[t.name] = name
         seen.add(name)
         t.name = name
         t.tools = [x for x in dict.fromkeys(t.tools) if x in tool_names]
         if t.type == "orchestrator" and not can_nest:
             t.type = "worker"
     for t in tasks:
-        t.depends_on = [d for d in dict.fromkeys(t.depends_on) if d in seen and d != t.name]
+        t.depends_on = [
+            names.get(d, d)
+            for d in dict.fromkeys(t.depends_on)
+            if names.get(d, d) in seen and names.get(d, d) != t.name
+        ]
     plan.tasks = tasks
     if waves(plan) is None:
         log.warning("plan has a dependency cycle; running all tasks in parallel")

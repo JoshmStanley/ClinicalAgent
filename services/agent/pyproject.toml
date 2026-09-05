@@ -5,6 +5,7 @@ description = "LLM gateway and agent loop: executes runs, streams events, report
 requires-python = ">=3.12"
 dependencies = [
     "clinical-common",
+    "langfuse>=3.0",
     "anthropic>=0.69",
     "mcp>=1.10",
     "langgraph>=1.0",

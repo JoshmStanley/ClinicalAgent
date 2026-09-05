@@ -54,7 +54,7 @@ def test_parse_plan_truncates_and_dedupes_names():
         can_nest=True,
     )
     assert [t.name for t in plan.tasks] == ["same_name", "same_name_2", "c"]
-    assert plan.tasks[2].depends_on == ["same_name"]
+    assert plan.tasks[2].depends_on == ["same_name_2"]
 
 
 def test_parse_plan_breaks_cycles():

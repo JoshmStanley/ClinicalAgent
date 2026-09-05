@@ -1,7 +1,7 @@
 # Traefik dynamic configuration (file provider, hot-reloaded).
 #
 # Routing, auth, rate limiting and CORS for the public API. Services are
-# addressed by their Compose DNS name; Docker round-robins across replicas.
+# addressed by their Compose DNS name. List individual backend URLs to balance replicas.
 # On Kubernetes the same routers/middlewares become IngressRoute/Middleware CRDs.
 
 http:
@@ -17,7 +17,7 @@ http:
       middlewares: [public]
       service: conversations
     financials:
-      rule: "PathPrefix(`/api/budgets`) || PathPrefix(`/api/usage`)"
+      rule: "PathPrefix(`/api/budgets`) || Path(`/api/usage/summary`)"
       entryPoints: [web]
       middlewares: [public]
       service: financials
@@ -61,13 +61,18 @@ http:
         accessControlAllowOriginList: [{{ env "CORS_ORIGINS" }}]
         accessControlAllowCredentials: true
         accessControlMaxAge: 600
+    strip-secrets:
+      headers:
+        customRequestHeaders:
+          X-Usage-Writer-Token: ""
+          Authorization: ""
     # Public routes live under /api; services see the bare path.
     strip-api:
       stripPrefix:
         prefixes: [/api]
     public:
       chain:
-        middlewares: [cors, auth, ratelimit, strip-api]
+        middlewares: [cors, auth, ratelimit, strip-secrets, strip-api]
 
   services:
     identity:

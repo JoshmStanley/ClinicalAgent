@@ -21,6 +21,7 @@ from clinical_common.auth import Principal, principal_dependency, require_admin
 from clinical_common.db import Base, Database
 from clinical_common.events import Usage
 from clinical_common.logging import configure_logging
+from clinical_common.telemetry import configure_telemetry, instrument_app, shutdown_telemetry
 from financials.models import SCOPE_ORG, SCOPE_ROLE, SCOPE_USER, Budget, UsageRecord
 from financials.pricing import cost_usd
 from financials.settings import Settings, get_settings
@@ -33,13 +34,16 @@ async def lifespan(app: FastAPI):
     global db
     settings = get_settings()
     configure_logging(settings.log_level, settings.service_name)
+    configure_telemetry(settings.service_name, settings)
     db = Database(settings.database_url)
     await db.create_all(Base)
     yield
+    shutdown_telemetry()
     await db.dispose()
 
 
 app = FastAPI(title="financials", lifespan=lifespan)
+instrument_app(app)
 get_principal = principal_dependency(get_settings)
 
 

@@ -9,12 +9,27 @@ from __future__ import annotations
 import json
 import logging
 import re
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from typing import Any, Protocol
 
 from agent.tools import ToolBox
 from clinical_common.events import RunEventType, Usage
 
 log = logging.getLogger(__name__)
+active_trace = ContextVar("active_run_trace", default=None)
+
+
+@asynccontextmanager
+async def generation_trace(model, messages):
+    rt = active_trace.get()
+    if rt is None:
+        yield None
+    else:
+        async with rt.generation(model, messages) as generation:
+            yield generation
+
+
 CITE_RE = re.compile(r"\[\[chunk:([^\]\s]+)\]\]")
 
 
@@ -95,7 +110,7 @@ async def call_model(
         if tool_choice is not None:
             kwargs["tool_choice"] = tool_choice
 
-    async with client.beta.messages.stream(**kwargs) as stream:
+    async with generation_trace(model, messages) as generation, client.beta.messages.stream(**kwargs) as stream:
         async for event in stream:
             if event.type == "content_block_delta":
                 if event.delta.type == "text_delta" and emit_text:
@@ -105,6 +120,8 @@ async def call_model(
             elif event.type == "content_block_start" and event.content_block.type == "tool_use":
                 sink.emit(RunEventType.TOOL_CALL, tool_use_id=event.content_block.id, name=event.content_block.name)
         final = await stream.get_final_message()
+        if generation is not None:
+            generation.record(final)
 
     usage.add(final)
     if final.stop_reason == "refusal":
@@ -123,7 +140,13 @@ async def run_tool(tools: ToolBox, sink: Emitter, block: Any) -> dict[str, Any]:
     """Executes one tool_use block, emits tool.result (and concept_sheet.updated), returns the tool_result."""
     args = block.input if isinstance(block.input, dict) else json.loads(block.input)
     try:
-        output, info = await tools.execute(block.name, args)
+        rt = active_trace.get()
+        if rt is None:
+            output, info = await tools.execute(block.name, args)
+        else:
+            async with rt.tool_span(block.name, args) as ts:
+                output, info = await tools.execute(block.name, args)
+                ts.ok(output)
         if "concept_sheet" in info:
             sink.emit(RunEventType.CONCEPT_SHEET_UPDATED, version=info["concept_sheet"]["version"])
         sink.emit(

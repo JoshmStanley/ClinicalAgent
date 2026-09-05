@@ -14,7 +14,7 @@ Traefik Proxy (open source) is the API gateway. It owns everything that is not a
 - **Routing** by path prefix to services, declared in `infra/traefik/dynamic.yml` locally (hot-reloaded) and as Kubernetes CRDs later. Public routes live under `/api`; the prefix is stripped before the request reaches a service. `/internal/*` routes are never exposed because no router matches them.
 - **Authentication** via ForwardAuth: every request is first sent to identity `/auth/verify`, which validates the Clerk JWT (or dev headers locally) and answers 204 with `X-Internal-Token` and `X-Principal-*` headers. Traefik copies those onto the upstream request. Because identity always sets all four headers, a client cannot smuggle its own.
 - **Rate limiting** per organization, keyed on the `X-Principal-Org` header that ForwardAuth just set. Defaults: 120 requests/minute with a burst of 40 (`RATE_LIMIT_PER_MINUTE`, `RATE_LIMIT_BURST`).
-- **CORS**, load balancing across replicas (`docker compose up --scale conversations=3` just works), retries and TLS when deployed.
+- **CORS** and explicit backend load balancing. The file provider does not discover Compose replicas: list each replica URL in the service’s `loadBalancer.servers` configuration, or use a discovery provider when deploying. Rate limits are local to each Traefik instance. TLS and retries are not configured in this local stack.
 
 Middleware chain per public router: `cors → auth → ratelimit → strip-api`. Services trust the internal token and never see Clerk tokens.
 

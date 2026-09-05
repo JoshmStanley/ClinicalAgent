@@ -2,10 +2,10 @@ name: ci
 
 on:
   workflow_dispatch:
+  workflow_dispatch:
   push:
     branches: [main, dev, sandbox]
   pull_request:
-    branches: [main, dev, sandbox]
 
 jobs:
   ci:
@@ -40,6 +40,9 @@ jobs:
     name: docker build
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
+    strategy:
+      matrix:
+        package: [agent, conversations, identity, financials, documents, ingestion, clinicaltrials-mcp]
     steps:
       - uses: actions/checkout@v4
-      - run: docker build --build-arg PACKAGE=conversations -t clinicalagent-conversations .
+      - run: docker build --build-arg PACKAGE=${{ matrix.package }} -t clinicalagent-${{ matrix.package }} .

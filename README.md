@@ -51,7 +51,7 @@ Each service reads a `.env` in the repo root; the local defaults point at the Co
 make lint
 make test
 # Include Postgres integration tests (CI runs these automatically):
-TEST_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/conversations make test
+TEST_DATABASE_URL=<disposable-postgres-url> make test
 ```
 
 ## API sketch (through Traefik on :8000)
@@ -75,3 +75,28 @@ GET  /api/usage/summary
 ## Status
 
 Scaffold. Working end to end locally: upload → ingest → ask → cited streamed answer, with auth and rate limiting at the edge and budgets enforced when a run is queued. The agent is a LangGraph orchestrator → subagent graph (parallel fan-out, dependencies, nested orchestrators, per-subagent event tracks); it is covered by unit tests with a fake model and has not yet been exercised against the live API. Not yet built: web client, Alembic migrations, structured trial-metadata extraction at ingest time, reservation-based hard budget caps, the production ingestion pipeline described in the HLD.
+
+
+## Observability
+
+OpenTelemetry traces HTTP, database, Kafka, model, and tool activity. It is disabled unless
+`OTEL_EXPORTER_OTLP_ENDPOINT` is set. Start the collector and Jaeger with
+`docker compose --profile observability up -d otel-collector jaeger`; use
+`http://otel-collector:4317` for services in Docker and `http://localhost:4317` for local processes.
+Jaeger is available on localhost:16686. Recreate services after changing environment variables.
+
+Langfuse is optional: configure `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and
+`LANGFUSE_HOST` for your managed or self-hosted instance. Enabling it sends prompt/response and
+tool content to that instance. These content-bearing spans are excluded from the generic OTLP exporter.
+The duplicate interrupted tracing implementation remains preserved in the original observability worktree.
+
+## Integration validation
+
+The phone reliability patch, Traefik and LangGraph changes were reconciled together.
+Agent fan-out is bounded by `AGENT_MAX_PARALLEL` and `AGENT_MAX_TOTAL_AGENTS` across the run.
+Nested delegation cannot regain excluded tools; only one worker per run may update the concept sheet.
+Application service ports are internal to Compose; use Traefik on :8000.
+
+This remains a development prototype. Budget admission is not a hard dollar cap; usage settlement
+on failed runs, durable worker recovery/outbox delivery, schema migrations for existing databases,
+and live provider validation remain follow-up work. Tests use fake model responses and disposable Postgres.
