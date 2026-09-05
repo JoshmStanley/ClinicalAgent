@@ -24,6 +24,7 @@ from clinical_common.logging import configure_logging
 from clinical_common.opensearch import CHUNKS_INDEX, ensure_chunks_index
 from clinical_common.opensearch import client as os_client_factory
 from clinical_common.storage import ObjectStore
+from clinical_common.telemetry import configure_telemetry
 from ingestion.chunk import chunk_sections
 from ingestion.convert import convert
 from ingestion.sections import split_sections
@@ -149,6 +150,7 @@ STAGES: dict[str, tuple[str, str]] = {
 
 async def main(stage_name: str) -> None:
     settings = get_settings()
+    configure_telemetry(settings.service_name, settings)
     configure_logging(settings.log_level, f"ingestion-{stage_name}")
     ctx = Ctx(settings)
     await ctx.producer.start()

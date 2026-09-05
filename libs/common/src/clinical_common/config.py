@@ -29,6 +29,8 @@ class BaseServiceSettings(BaseSettings):
     # --- infra ------------------------------------------------------------
     kafka_bootstrap_servers: str = "localhost:19092"
 
+    otel_exporter_otlp_endpoint: str = ""
+
     # --- service discovery ------------------------------------------------
     identity_url: str = "http://localhost:8001"
     conversations_url: str = "http://localhost:8002"

@@ -20,3 +20,6 @@ data/
 .DS_Store
 .idea/
 .vscode/
+
+# Claude Code session data
+.claude/
