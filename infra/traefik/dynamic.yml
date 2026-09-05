@@ -1,0 +1,89 @@
+# Traefik dynamic configuration (file provider, hot-reloaded).
+#
+# Routing, auth, rate limiting and CORS for the public API. Services are
+# addressed by their Compose DNS name. List individual backend URLs to balance replicas.
+# On Kubernetes the same routers/middlewares become IngressRoute/Middleware CRDs.
+
+http:
+  routers:
+    identity:
+      rule: "PathPrefix(`/api/me`) || PathPrefix(`/api/orgs`)"
+      entryPoints: [web]
+      middlewares: [public]
+      service: identity
+    conversations:
+      rule: "PathPrefix(`/api/programs`) || PathPrefix(`/api/studies`) || PathPrefix(`/api/conversations`) || PathPrefix(`/api/runs`)"
+      entryPoints: [web]
+      middlewares: [public]
+      service: conversations
+    financials:
+      rule: "PathPrefix(`/api/budgets`) || Path(`/api/usage/summary`)"
+      entryPoints: [web]
+      middlewares: [public]
+      service: financials
+    documents:
+      rule: "PathPrefix(`/api/documents`) || PathPrefix(`/api/search`)"
+      entryPoints: [web]
+      middlewares: [public]
+      service: documents
+    # Clerk webhooks are verified by signature inside identity, not by ForwardAuth.
+    clerk-webhooks:
+      rule: "Path(`/webhooks/clerk`)"
+      entryPoints: [web]
+      service: identity
+
+  middlewares:
+    # Every request is authenticated by identity, which answers 204 with the
+    # principal headers. Traefik copies exactly these headers upstream, so a
+    # client can never smuggle its own.
+    auth:
+      forwardAuth:
+        address: http://identity:8001/auth/verify
+        trustForwardHeader: false      # strip client-supplied X-Forwarded-* headers
+        maxResponseBodySize: 65536     # verify answers with headers only
+        authResponseHeaders:
+          - X-Internal-Token
+          - X-Principal-User
+          - X-Principal-Org
+          - X-Principal-Role
+    # Per-organization rate limit, keyed on the header `auth` just set.
+    ratelimit:
+      rateLimit:
+        average: {{ env "RATE_LIMIT_PER_MINUTE" }}
+        period: 1m
+        burst: {{ env "RATE_LIMIT_BURST" }}
+        sourceCriterion:
+          requestHeaderName: X-Principal-Org
+    cors:
+      headers:
+        accessControlAllowMethods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+        accessControlAllowHeaders: ["*"]
+        accessControlAllowOriginList: [{{ env "CORS_ORIGINS" }}]
+        accessControlAllowCredentials: true
+        accessControlMaxAge: 600
+    strip-secrets:
+      headers:
+        customRequestHeaders:
+          X-Usage-Writer-Token: ""
+          Authorization: ""
+    # Public routes live under /api; services see the bare path.
+    strip-api:
+      stripPrefix:
+        prefixes: [/api]
+    public:
+      chain:
+        middlewares: [cors, auth, ratelimit, strip-secrets, strip-api]
+
+  services:
+    identity:
+      loadBalancer:
+        servers: [{url: http://identity:8001}]
+    conversations:
+      loadBalancer:
+        servers: [{url: http://conversations:8002}]
+    financials:
+      loadBalancer:
+        servers: [{url: http://financials:8004}]
+    documents:
+      loadBalancer:
+        servers: [{url: http://documents:8005}]

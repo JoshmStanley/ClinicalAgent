@@ -4,12 +4,12 @@
 main      deployed code                 ← merge from dev when a release is tested
 dev       integration / dev testing     ← merge from sandbox when a batch is tested
 sandbox   latest local development      ← merge feature branches here first
-feature/* new work                      ← branch from dev
+feature/* new work                      ← branch from sandbox
 ```
 
 Rules:
 
-1. Branch features from `dev`: `git switch -c feature/<short-name> dev`.
+1. Branch features from the latest `sandbox`: `git fetch origin sandbox && git switch -c feature/<short-name> origin/sandbox`.
 2. Open a PR into `sandbox`. CI (lint + tests) must pass.
 3. Once the batch on `sandbox` is tested, PR `sandbox → dev`.
 4. Once `dev` is validated in the dev environment, PR `dev → main`. `main` is what gets deployed.

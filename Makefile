@@ -25,9 +25,7 @@ logs:
 build:
 	docker compose build
 
-# Run one service locally against dockerised infra, e.g. `make run-gateway`.
-run-gateway:
-	uv run --package gateway uvicorn gateway.main:app --port 8000 --reload
+# Run one service locally against dockerised infra, e.g. `make run-conversations`.
 run-identity:
 	uv run --package identity uvicorn identity.main:app --port 8001 --reload
 run-conversations:

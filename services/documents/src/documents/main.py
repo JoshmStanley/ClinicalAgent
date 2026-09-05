@@ -25,6 +25,7 @@ from clinical_common.logging import configure_logging
 from clinical_common.opensearch import CHUNKS_INDEX, rrf_merge
 from clinical_common.opensearch import client as os_client_factory
 from clinical_common.storage import ObjectStore
+from clinical_common.telemetry import configure_telemetry, instrument_app, shutdown_telemetry
 from documents.models import STATUS_UPLOADED, Document
 from documents.settings import Settings, get_settings
 
@@ -46,6 +47,7 @@ state = State()
 async def lifespan(app: FastAPI):
     settings = get_settings()
     configure_logging(settings.log_level, settings.service_name)
+    configure_telemetry(settings.service_name, settings)
     state.db = Database(settings.database_url)
     await state.db.create_all(Base)
     state.producer = JsonProducer(settings.kafka_bootstrap_servers)
@@ -62,12 +64,14 @@ async def lifespan(app: FastAPI):
     )
     state.opensearch = os_client_factory(settings.opensearch_url)
     yield
+    shutdown_telemetry()
     await state.producer.stop()
     await state.opensearch.close()
     await state.db.dispose()
 
 
 app = FastAPI(title="documents", lifespan=lifespan)
+instrument_app(app)
 get_principal = principal_dependency(get_settings)
 
 

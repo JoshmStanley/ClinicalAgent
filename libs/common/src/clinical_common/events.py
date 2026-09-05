@@ -15,7 +15,22 @@ from pydantic import BaseModel, Field
 
 
 class RunEventType(StrEnum):
+    """Event types appended to a run's log.
+
+    Orchestration events (see docs/agent-orchestration.md):
+    - ``plan``: the orchestrator's task list for one orchestration level.
+    - ``subagent.started`` / ``subagent.completed``: lifecycle of one subagent (worker or nested orchestrator).
+
+    Events produced while a subagent is working (``text.delta``, ``thinking.delta``, ``tool.call``,
+    ``tool.result``, ``concept_sheet.updated``, nested ``plan``/``subagent.*``) carry ``subagent_id`` and
+    ``subagent_name`` in their payload so a client can render one track per subagent. Events without a
+    ``subagent_id`` belong to the top-level orchestrator or the final synthesized answer.
+    """
+
     RUN_STARTED = "run.started"
+    PLAN = "plan"
+    SUBAGENT_STARTED = "subagent.started"
+    SUBAGENT_COMPLETED = "subagent.completed"
     THINKING_DELTA = "thinking.delta"
     TEXT_DELTA = "text.delta"
     TOOL_CALL = "tool.call"
@@ -44,10 +59,10 @@ class RunRequested(BaseModel):
 
 class Usage(BaseModel):
     model: str
-    input_tokens: int = 0
-    output_tokens: int = 0
-    cache_read_input_tokens: int = 0
-    cache_creation_input_tokens: int = 0
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    cache_read_input_tokens: int = Field(default=0, ge=0)
+    cache_creation_input_tokens: int = Field(default=0, ge=0)
 
 
 class Citation(BaseModel):

@@ -9,12 +9,14 @@ regardless of whether anyone is watching.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+import httpx
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,6 +27,7 @@ from clinical_common.events import RunEvent as RunEventIn
 from clinical_common.events import RunRequested
 from clinical_common.kafka import JsonProducer, Topics
 from clinical_common.logging import configure_logging
+from clinical_common.telemetry import configure_telemetry, instrument_app, shutdown_telemetry
 from conversations.models import (
     RUN_QUEUED,
     RUN_TERMINAL,
@@ -34,6 +37,7 @@ from conversations.models import (
     Program,
     Run,
     RunEvent,
+    RunEventBatch,
     Study,
 )
 from conversations.schemas import (
@@ -62,6 +66,7 @@ log = logging.getLogger(__name__)
 class State:
     db: Database
     producer: JsonProducer
+    http: httpx.AsyncClient
 
 
 state = State()
@@ -71,16 +76,21 @@ state = State()
 async def lifespan(app: FastAPI):
     settings = get_settings()
     configure_logging(settings.log_level, settings.service_name)
+    configure_telemetry(settings.service_name, settings)
     state.db = Database(settings.database_url)
     await state.db.create_all(Base)
     state.producer = JsonProducer(settings.kafka_bootstrap_servers)
     await state.producer.start()
+    state.http = httpx.AsyncClient(timeout=10.0)
     yield
+    shutdown_telemetry()
+    await state.http.aclose()
     await state.producer.stop()
     await state.db.dispose()
 
 
 app = FastAPI(title="conversations", lifespan=lifespan)
+instrument_app(app)
 get_principal = principal_dependency(get_settings)
 
 
@@ -296,6 +306,22 @@ async def concept_sheet_versions(
     return [sheet_out(x) for x in rows]
 
 
+async def _check_budget(p: Principal, settings: Settings) -> None:
+    """Ask financials whether this principal may start a run. 402 if any budget is exhausted."""
+    try:
+        r = await state.http.post(
+            f"{settings.financials_url}/check", headers=p.internal_headers(settings.internal_token)
+        )
+        r.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise HTTPException(503, f"Budget service unavailable: {exc}") from exc
+    verdict = r.json()
+    if not verdict["allowed"]:
+        raise HTTPException(
+            402, {"message": "Usage budget exhausted", "reason": verdict["reason"], "budgets": verdict["budgets"]}
+        )
+
+
 # ------------------------------------------------------------- conversations
 
 
@@ -359,9 +385,11 @@ async def send_message(
     body: UserMessageIn,
     p: Principal = Depends(get_principal),
     s: AsyncSession = Depends(get_session),
+    settings: Settings = Depends(get_settings),
 ):
-    """Store the user message, queue a run, and publish it for the agent."""
+    """Budget-check, store the user message, queue a run, and publish it for the agent."""
     c = await _conversation(s, conversation_id, p)
+    await _check_budget(p, settings)
     active = await s.scalar(
         select(func.count()).select_from(Run).where(Run.conversation_id == c.id, Run.status.notin_(RUN_TERMINAL))
     )
@@ -492,14 +520,28 @@ async def append_events(
     events: list[RunEventIn],
     p: Principal = Depends(get_principal),
     s: AsyncSession = Depends(get_session),
+    batch_id: uuid.UUID | None = Header(None, alias="X-Event-Batch-Id"),
 ):
     run = await s.scalar(select(Run).where(Run.id == run_id).with_for_update())
     if not run or run.org_id != p.org_id:
         raise HTTPException(404, "Run not found")
+    payload_hash = hashlib.sha256(
+        json.dumps([e.model_dump(mode="json") for e in events], sort_keys=True).encode()
+    ).hexdigest()
+    if batch_id is not None:
+        receipt = await s.get(RunEventBatch, (run_id, batch_id))
+        if receipt:
+            if receipt.payload_hash != payload_hash:
+                raise HTTPException(409, "Event batch ID reused with different events")
+            return {"last_seq": receipt.last_seq}
+    if run.status in RUN_TERMINAL:
+        raise HTTPException(409, "Cannot append new events to a terminal run")
     seq = await s.scalar(select(func.coalesce(func.max(RunEvent.seq), 0)).where(RunEvent.run_id == run_id))
     for ev in events:
         seq += 1
         s.add(RunEvent(run_id=run_id, seq=seq, type=str(ev.type), payload=ev.payload))
+    if batch_id is not None:
+        s.add(RunEventBatch(run_id=run_id, batch_id=batch_id, payload_hash=payload_hash, last_seq=seq))
     await s.commit()
     return {"last_seq": seq}
 
@@ -508,13 +550,24 @@ async def append_events(
 async def patch_run(
     run_id: uuid.UUID, body: RunPatch, p: Principal = Depends(get_principal), s: AsyncSession = Depends(get_session)
 ):
-    run = await _run(s, run_id, p)
+    run = await s.scalar(select(Run).where(Run.id == run_id).with_for_update())
+    if not run or run.org_id != p.org_id:
+        raise HTTPException(404, "Run not found")
+    if run.status in RUN_TERMINAL:
+        if body.status and body.status != run.status:
+            raise HTTPException(409, "Run is already terminal")
+        return run_out(run)
     if body.status:
         run.status = body.status
         if body.status == "running" and not run.started_at:
             run.started_at = utcnow()
         if body.status in RUN_TERMINAL:
             run.finished_at = utcnow()
+            # The SSE terminal event and terminal status must agree even if
+            # the HTTP response is lost. A repeated PATCH adds no second event.
+            seq = await s.scalar(select(func.coalesce(func.max(RunEvent.seq), 0)).where(RunEvent.run_id == run_id))
+            payload = {"error": body.error} if body.status == "failed" else {}
+            s.add(RunEvent(run_id=run_id, seq=seq + 1, type=f"run.{body.status}", payload=payload))
     if body.error is not None:
         run.error = body.error
     if body.usage is not None:
