@@ -4,19 +4,31 @@
 
 - **Study is the workspace.** A study owns conversations, referenced documents and a versioned concept sheet. Programs group studies into a development plan.
 - **Runs are event logs.** Every agent execution appends to a persisted run event log. The client's SSE stream is a tail of that log, so runs survive disconnects and a user can resume tomorrow with `Last-Event-ID`.
-- **Org id everywhere.** Every table has `org_id`; every OpenSearch query carries a server-side `org_id` filter. The principal comes from a Clerk JWT at the gateway and is forwarded to internal services with a shared internal token.
+- **Org id everywhere.** Every table has `org_id`; every OpenSearch query carries a server-side `org_id` filter. The principal is established once at the edge and forwarded to internal services as headers with a shared internal token.
 - **Citations carry chunk identity.** Chunks keep document id, section path and page. The model cites `[[chunk:ID]]`; the agent resolves those to citation events and stores them on the assistant message.
+
+## Edge: Traefik
+
+Traefik Proxy (open source) is the API gateway. It owns everything that is not application logic:
+
+- **Routing** by path prefix to services, declared in `infra/traefik/dynamic.yml` locally (hot-reloaded) and as Kubernetes CRDs later. Public routes live under `/api`; the prefix is stripped before the request reaches a service. `/internal/*` routes are never exposed because no router matches them.
+- **Authentication** via ForwardAuth: every request is first sent to identity `/auth/verify`, which validates the Clerk JWT (or dev headers locally) and answers 204 with `X-Internal-Token` and `X-Principal-*` headers. Traefik copies those onto the upstream request. Because identity always sets all four headers, a client cannot smuggle its own.
+- **Rate limiting** per organization, keyed on the `X-Principal-Org` header that ForwardAuth just set. Defaults: 120 requests/minute with a burst of 40 (`RATE_LIMIT_PER_MINUTE`, `RATE_LIMIT_BURST`).
+- **CORS**, load balancing across replicas (`docker compose up --scale conversations=3` just works), retries and TLS when deployed.
+
+Middleware chain per public router: `cors → auth → ratelimit → strip-api`. Services trust the internal token and never see Clerk tokens.
 
 ## Request flow: sending a message
 
 ```
-client ──POST /api/conversations/{id}/messages──▶ gateway
-  gateway ──POST /check──▶ financials            (budget gate: 402 if exhausted)
-  gateway ──POST /conversations/{id}/messages──▶ conversations
+client ──POST /api/conversations/{id}/messages──▶ traefik
+  traefik ──GET /auth/verify──▶ identity           (401 if not authenticated)
+  traefik ──POST /conversations/{id}/messages──▶ conversations   (+ X-Principal-* headers)
+      conversations ──POST /check──▶ financials    (402 if a budget is exhausted)
       conversations: insert user message + run(queued), publish runs.requested (Kafka)
   ◀── 202 {run_id}
 
-client ──GET /api/runs/{run_id}/stream──▶ gateway ──▶ conversations (SSE tail of run_events)
+client ──GET /api/runs/{run_id}/stream──▶ traefik ──▶ conversations (SSE tail of run_events)
 
 agent worker (Kafka consumer of runs.requested):
   PATCH run running → GET run context (history, study, concept sheet)
@@ -41,17 +53,19 @@ Search is hybrid: BM25 and kNN run as two queries and are fused with reciprocal 
 
 ## Budgets
 
-`financials` stores monthly USD limits at org, role and user scope. The gateway asks `/check` before queueing a run; the agent posts actual token usage after the run and the ledger prices it per model. Concurrent runs can overshoot a cap by the combined cost of all admitted work. A reservation model can be added if hard caps are required.
+`financials` stores monthly USD limits at org, role and user scope. The conversations service asks `/check` before queueing a run; the agent posts actual token usage after the run and the ledger prices it per model. Concurrent runs can overshoot a cap by the combined cost of all admitted work. A reservation model can be added if hard caps are required.
+
 
 ## Identity
 
-Clerk is the source of truth. `identity` consumes Clerk webhooks (users, organizations, memberships) into its own tables so services can list members and map roles to quotas without calling Clerk. Session tokens carry `org_id` and `org_role`; the gateway requires an active org.
+Clerk is the source of truth. `identity` consumes Clerk webhooks (users, organizations, memberships) into its own tables so services can list members and map roles to quotas without calling Clerk. Session tokens carry `org_id` and `org_role`; `/auth/verify` requires an active org.
 
 ## Local vs production
 
 | Concern | Local | Production |
 |---|---|---|
-| Auth | `AUTH_MODE=dev`, `X-Dev-*` headers | `AUTH_MODE=clerk`, JWKS verification |
+| Auth | `AUTH_MODE=dev`, `X-Dev-*` headers | `AUTH_MODE=clerk`, JWKS verification in identity |
+| Edge | Traefik, file provider (`infra/traefik/dynamic.yml`) | Traefik ingress controller (or Envoy Gateway) with the same middlewares as CRDs |
 | Object storage | MinIO | S3 |
 | Kafka | Redpanda | Redpanda / MSK / Confluent |
 | Embeddings | `fake` (deterministic) | Voyage |

@@ -1,12 +1,15 @@
 """Authentication and multi-tenant principal resolution.
 
-Three ways a request can carry identity:
+Two trust boundaries:
 
-1. Internal (service-to-service): the gateway verified the caller and forwards
-   `X-Internal-Token` plus `X-Principal-*` headers. Services trust these only
-   when the token matches their configured `internal_token`.
-2. Clerk JWT (`Authorization: Bearer <token>`) - production mode at the gateway.
-3. Dev headers (`X-Dev-User-Id`, `X-Dev-Org-Id`, `X-Dev-Role`) - local only.
+* **Edge** (Traefik ForwardAuth -> identity `/auth/verify`): a Clerk JWT
+  (`Authorization: Bearer`) or, in local dev only, `X-Dev-*` headers are turned
+  into a `Principal`. Traefik copies the resulting `X-Principal-*` and
+  `X-Internal-Token` headers onto the request it forwards upstream.
+* **Internal** (every service): requests must carry `X-Internal-Token` matching
+  the service's configured secret plus the `X-Principal-*` headers. Services
+  never see Clerk tokens. In dev mode a service will also accept `X-Dev-*`
+  headers directly so it can be exercised without the edge.
 
 Every request resolves to a `Principal` that carries the org id. All data
 access must be scoped by `principal.org_id`.
@@ -27,6 +30,7 @@ HEADER_INTERNAL_TOKEN = "X-Internal-Token"
 HEADER_PRINCIPAL_USER = "X-Principal-User"
 HEADER_PRINCIPAL_ORG = "X-Principal-Org"
 HEADER_PRINCIPAL_ROLE = "X-Principal-Role"
+PRINCIPAL_HEADERS = (HEADER_INTERNAL_TOKEN, HEADER_PRINCIPAL_USER, HEADER_PRINCIPAL_ORG, HEADER_PRINCIPAL_ROLE)
 
 HEADER_DEV_USER = "X-Dev-User-Id"
 HEADER_DEV_ORG = "X-Dev-Org-Id"
@@ -47,7 +51,7 @@ class Principal:
         return self.role == ROLE_ADMIN
 
     def internal_headers(self, internal_token: str) -> dict[str, str]:
-        """Headers to forward this principal to another internal service."""
+        """Headers that carry this principal to an internal service."""
         return {
             HEADER_INTERNAL_TOKEN: internal_token,
             HEADER_PRINCIPAL_USER: self.user_id,
@@ -91,10 +95,27 @@ def _principal_from_clerk_token(token: str, settings: BaseServiceSettings) -> Pr
     return Principal(user_id=user_id, org_id=org_id, role=role or ROLE_MEMBER)
 
 
-def resolve_principal(request: Request, settings: BaseServiceSettings) -> Principal:
+def principal_from_edge(request: Request, settings: BaseServiceSettings) -> Principal:
+    """Resolve an *external* caller: Clerk bearer token, or dev headers in dev mode."""
     headers = request.headers
+    authz = headers.get("Authorization", "")
+    if authz.lower().startswith("bearer "):
+        if settings.auth_mode != "clerk":
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Bearer auth disabled in dev mode")
+        return _principal_from_clerk_token(authz.split(" ", 1)[1].strip(), settings)
 
-    # 1. Internal forwarded principal.
+    if settings.auth_mode == "dev":
+        user_id = headers.get(HEADER_DEV_USER)
+        org_id = headers.get(HEADER_DEV_ORG)
+        if user_id and org_id:
+            return Principal(user_id=user_id, org_id=org_id, role=headers.get(HEADER_DEV_ROLE, ROLE_MEMBER))
+
+    raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Not authenticated")
+
+
+def resolve_principal(request: Request, settings: BaseServiceSettings) -> Principal:
+    """Resolve the caller of an *internal* service."""
+    headers = request.headers
     internal = headers.get(HEADER_INTERNAL_TOKEN)
     if internal is not None:
         if internal != settings.internal_token:
@@ -105,22 +126,7 @@ def resolve_principal(request: Request, settings: BaseServiceSettings) -> Princi
         if not user_id or not org_id:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Missing principal headers")
         return Principal(user_id=user_id, org_id=org_id, role=role)
-
-    # 2. Clerk bearer token.
-    authz = headers.get("Authorization", "")
-    if authz.lower().startswith("bearer "):
-        if settings.auth_mode != "clerk":
-            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Bearer auth disabled in dev mode")
-        return _principal_from_clerk_token(authz.split(" ", 1)[1].strip(), settings)
-
-    # 3. Dev headers.
-    if settings.auth_mode == "dev":
-        user_id = headers.get(HEADER_DEV_USER)
-        org_id = headers.get(HEADER_DEV_ORG)
-        if user_id and org_id:
-            return Principal(user_id=user_id, org_id=org_id, role=headers.get(HEADER_DEV_ROLE, ROLE_MEMBER))
-
-    raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Not authenticated")
+    return principal_from_edge(request, settings)
 
 
 def principal_dependency(get_settings):

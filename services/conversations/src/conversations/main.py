@@ -15,6 +15,7 @@ import logging
 import uuid
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
@@ -64,6 +65,7 @@ log = logging.getLogger(__name__)
 class State:
     db: Database
     producer: JsonProducer
+    http: httpx.AsyncClient
 
 
 state = State()
@@ -77,7 +79,9 @@ async def lifespan(app: FastAPI):
     await state.db.create_all(Base)
     state.producer = JsonProducer(settings.kafka_bootstrap_servers)
     await state.producer.start()
+    state.http = httpx.AsyncClient(timeout=10.0)
     yield
+    await state.http.aclose()
     await state.producer.stop()
     await state.db.dispose()
 
@@ -298,6 +302,22 @@ async def concept_sheet_versions(
     return [sheet_out(x) for x in rows]
 
 
+async def _check_budget(p: Principal, settings: Settings) -> None:
+    """Ask financials whether this principal may start a run. 402 if any budget is exhausted."""
+    try:
+        r = await state.http.post(
+            f"{settings.financials_url}/check", headers=p.internal_headers(settings.internal_token)
+        )
+        r.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise HTTPException(503, f"Budget service unavailable: {exc}") from exc
+    verdict = r.json()
+    if not verdict["allowed"]:
+        raise HTTPException(
+            402, {"message": "Usage budget exhausted", "reason": verdict["reason"], "budgets": verdict["budgets"]}
+        )
+
+
 # ------------------------------------------------------------- conversations
 
 
@@ -361,9 +381,11 @@ async def send_message(
     body: UserMessageIn,
     p: Principal = Depends(get_principal),
     s: AsyncSession = Depends(get_session),
+    settings: Settings = Depends(get_settings),
 ):
-    """Store the user message, queue a run, and publish it for the agent."""
+    """Budget-check, store the user message, queue a run, and publish it for the agent."""
     c = await _conversation(s, conversation_id, p)
+    await _check_budget(p, settings)
     active = await s.scalar(
         select(func.count()).select_from(Run).where(Run.conversation_id == c.id, Run.status.notin_(RUN_TERMINAL))
     )

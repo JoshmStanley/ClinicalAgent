@@ -10,9 +10,9 @@ See [docs/architecture.md](docs/architecture.md) for the design and [docs/branch
 
 | Service | Port | Role |
 |---|---|---|
-| `gateway` | 8000 | Public API. Verifies Clerk JWTs, checks budgets, routes to services, streams SSE through. |
-| `identity` | 8001 | Users, orgs, memberships, roles. Synced from Clerk webhooks. |
-| `conversations` | 8002 | Programs, studies, versioned concept sheets, conversations, runs and the run event log. |
+| `traefik` | 8000 | API gateway (Traefik Proxy, MIT). Routing, ForwardAuth to identity, per-org rate limiting, CORS, load balancing. Dashboard on `:8080` locally. |
+| `identity` | 8001 | Users, orgs, memberships, roles. Synced from Clerk webhooks. Serves `/auth/verify` for Traefik ForwardAuth. |
+| `conversations` | 8002 | Programs, studies, versioned concept sheets, conversations, runs and the run event log. Budget-gates new runs. |
 | `agent` | worker | Consumes `runs.requested`, drives the Claude tool loop, streams events, reports usage. |
 | `financials` | 8004 | Budgets per org / role / user and the usage ledger. |
 | `documents` | 8005 | Upload to object storage, ingestion status, hybrid BM25 + kNN search with citation metadata. |
@@ -32,7 +32,7 @@ make up                       # build and start everything
 make demo                     # upload a sample protocol, ask a question, stream the answer
 ```
 
-The demo runs in `AUTH_MODE=dev`, where the gateway trusts `X-Dev-User-Id`, `X-Dev-Org-Id` and `X-Dev-Role` headers instead of a Clerk JWT. Never enable dev mode outside local development.
+The demo runs in `AUTH_MODE=dev`, where the identity service's `/auth/verify` (called by Traefik on every request) trusts `X-Dev-User-Id`, `X-Dev-Org-Id` and `X-Dev-Role` headers instead of a Clerk JWT. Never enable dev mode outside local development.
 
 Embeddings default to a deterministic `fake` provider so the pipeline runs with no extra keys. For real retrieval quality set `EMBEDDING_PROVIDER=voyage` and `VOYAGE_API_KEY`.
 
@@ -54,7 +54,7 @@ make test
 TEST_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/conversations make test
 ```
 
-## API sketch (through the gateway)
+## API sketch (through Traefik on :8000)
 
 ```
 GET  /api/me
@@ -66,7 +66,7 @@ POST /api/documents                      multipart file upload (starts ingestion
 GET  /api/documents/{id}                 status: uploaded → converted → sectioned → chunked → indexed
 POST /api/search                         {query, top_k}
 POST /api/conversations                  {title, study_id?}
-POST /api/conversations/{id}/messages    {text} -> 202 {message, run_id}   (budget-checked)
+POST /api/conversations/{id}/messages    {text} -> 202 {message, run_id}   (402 if a budget is exhausted)
 GET  /api/runs/{id}/stream               SSE tail of the run; resumable with Last-Event-ID or ?after=
 PUT  /api/budgets                        {scope: org|role|user, scope_key, monthly_limit_usd}  (admin)
 GET  /api/usage/summary
@@ -74,4 +74,4 @@ GET  /api/usage/summary
 
 ## Status
 
-Scaffold. Working end to end locally: upload → ingest → ask → cited streamed answer, with budgets enforced at the gateway. Not yet built: web client, Alembic migrations, structured trial-metadata extraction at ingest time, reservation-based hard budget caps, the production ingestion pipeline described in the HLD.
+Scaffold. Working end to end locally: upload → ingest → ask → cited streamed answer, with auth and rate limiting at the edge and budgets enforced when a run is queued. Not yet built: web client, Alembic migrations, structured trial-metadata extraction at ingest time, reservation-based hard budget caps, the production ingestion pipeline described in the HLD.
