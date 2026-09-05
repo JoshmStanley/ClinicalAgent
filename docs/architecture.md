@@ -22,10 +22,11 @@ agent worker (Kafka consumer of runs.requested):
   PATCH run running → GET run context (history, study, concept sheet)
   loop: Claude stream ──▶ events (text.delta, thinking.delta, tool.call, tool.result, citation, concept_sheet.updated)
         tools: search_documents (documents /search), update_concept_sheet (conversations), ClinicalTrials.gov MCP tools
-  POST assistant message, PATCH run completed + usage, POST usage → financials
+  POST assistant message → flush events → POST /internal/usage to financials
+  → PATCH run completed + usage (atomically appends terminal event)
 ```
 
-Events are batched by the agent (text deltas coalesced, flushed every ~150 ms) and appended with a per-run sequence number. The SSE endpoint polls the table (250 ms) and emits `id: <seq>` so reconnects resume exactly.
+Events are batched by the agent (text deltas coalesced, flushed every ~150 ms) and appended with a per-run sequence number. Batches carry stable IDs and database receipts so transient HTTP retries do not duplicate events. Terminal status and its event are committed together. The SSE endpoint polls the table (250 ms) and emits `id: <seq>` so reconnects resume exactly.
 
 ## Ingestion (stopgap for the HLD pipeline)
 
@@ -40,7 +41,7 @@ Search is hybrid: BM25 and kNN run as two queries and are fused with reciprocal 
 
 ## Budgets
 
-`financials` stores monthly USD limits at org, role and user scope. The gateway asks `/check` before queueing a run; the agent posts actual token usage after the run and the ledger prices it per model. Concurrent runs can overshoot a cap by about one run. A reservation model can be added if hard caps are required.
+`financials` stores monthly USD limits at org, role and user scope. The gateway asks `/check` before queueing a run; the agent posts actual token usage after the run and the ledger prices it per model. Concurrent runs can overshoot a cap by the combined cost of all admitted work. A reservation model can be added if hard caps are required.
 
 ## Identity
 
@@ -62,3 +63,5 @@ Clerk is the source of truth. `identity` consumes Clerk webhooks (users, organiz
 - Structured trial-metadata extraction at ingest time (phase, endpoints, N, design) into queryable tables for trend analysis.
 - Replay of prior runs' tool trails into model context (currently only user/assistant text is replayed; the trail lives in the event log).
 - Run cancellation and per-run token budgets.
+
+See [Runs, Kafka, and event batches](runs-and-events.md) for the ID model, failure behavior, rollout requirements, and remaining recovery limitations.

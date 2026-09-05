@@ -5,6 +5,7 @@ from clinical_common.config import BaseServiceSettings
 
 class Settings(BaseServiceSettings):
     service_name: str = "financials"
+    usage_writer_token: str = ""
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/financials"
 
 

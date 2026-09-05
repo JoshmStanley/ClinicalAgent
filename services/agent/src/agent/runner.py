@@ -6,6 +6,8 @@ import asyncio
 import json
 import logging
 import re
+import uuid
+from contextlib import suppress
 from typing import Any
 
 import anthropic
@@ -28,6 +30,7 @@ class EventSink:
         self._client = client
         self._run_id = run_id
         self._buf: list[RunEvent] = []
+        self._pending: tuple[str, list[dict[str, Any]]] | None = None
         self._lock = asyncio.Lock()
         self._flush_seconds = flush_seconds
         self._task: asyncio.Task | None = None
@@ -39,12 +42,19 @@ class EventSink:
     async def __aexit__(self, *exc) -> None:
         if self._task:
             self._task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._task
         await self.flush()
 
     async def _loop(self) -> None:
         while True:
             await asyncio.sleep(self._flush_seconds)
-            await self.flush()
+            try:
+                await self.flush()
+            except httpx.HTTPError:
+                # Keep the pending batch intact; later events stay behind it.
+                # The final flush propagates a persistent failure to the run.
+                log.exception("event flush failed; retaining batch for retry")
 
     def emit(self, type_: RunEventType, **payload: Any) -> None:
         # Coalesce consecutive text/thinking deltas into one event per flush.
@@ -59,16 +69,28 @@ class EventSink:
 
     async def flush(self) -> None:
         async with self._lock:
-            if not self._buf:
-                return
-            batch, self._buf = self._buf, []
-            try:
-                r = await self._client.post(
-                    f"/internal/runs/{self._run_id}/events", json=[e.model_dump(mode="json") for e in batch]
-                )
-                r.raise_for_status()
-            except Exception:
-                log.exception("failed to flush %d events", len(batch))
+            while self._pending is not None or self._buf:
+                if self._pending is None:
+                    batch, self._buf = self._buf, []
+                    self._pending = (str(uuid.uuid4()), [e.model_dump(mode="json") for e in batch])
+                batch_id, payload = self._pending
+                for attempt in range(3):
+                    try:
+                        r = await self._client.post(
+                            f"/internal/runs/{self._run_id}/events",
+                            json=payload,
+                            headers={"X-Event-Batch-Id": batch_id},
+                        )
+                        r.raise_for_status()
+                        break
+                    except httpx.HTTPError as exc:
+                        retryable = not isinstance(exc, httpx.HTTPStatusError) or (
+                            exc.response.status_code in {408, 429} or exc.response.status_code >= 500
+                        )
+                        if not retryable or attempt == 2:
+                            raise
+                        await asyncio.sleep(0.1 * 2**attempt)
+                self._pending = None
 
 
 def _accumulate(total: Usage, u: Any) -> None:
@@ -119,41 +141,51 @@ class RunExecutor:
         principal = Principal(user_id=req.user_id, org_id=req.org_id, role=req.role)
         hdrs = principal.internal_headers(self.settings.internal_token)
         async with httpx.AsyncClient(base_url=self.settings.conversations_url, headers=hdrs, timeout=30) as conv:
-            await conv.patch(f"/internal/runs/{req.run_id}", json={"status": "running"})
-            ctx = (await conv.get(f"/internal/runs/{req.run_id}/context")).raise_for_status().json()
-            study_id = ctx["conversation"].get("study_id")
-            async with EventSink(conv, req.run_id, self.settings.event_flush_seconds) as sink:
-                sink.emit(RunEventType.RUN_STARTED, model=self.settings.agent_model)
-                try:
+            try:
+                (await conv.patch(f"/internal/runs/{req.run_id}", json={"status": "running"})).raise_for_status()
+                ctx = (await conv.get(f"/internal/runs/{req.run_id}/context")).raise_for_status().json()
+                study_id = ctx["conversation"].get("study_id")
+                async with EventSink(conv, req.run_id, self.settings.event_flush_seconds) as sink:
+                    sink.emit(RunEventType.RUN_STARTED, model=self.settings.agent_model)
                     async with ToolBox(self.settings, principal, study_id) as tools:
                         text, citations, usage = await self._loop(ctx, tools, sink)
-                    await conv.post(
-                        f"/internal/conversations/{req.conversation_id}/messages",
-                        json={"text": text, "citations": [c.model_dump() for c in citations], "run_id": req.run_id},
-                    )
+                    (
+                        await conv.post(
+                            f"/internal/conversations/{req.conversation_id}/messages",
+                            json={"text": text, "citations": [c.model_dump() for c in citations], "run_id": req.run_id},
+                        )
+                    ).raise_for_status()
                     sink.emit(RunEventType.USAGE, **usage.model_dump())
-                    sink.emit(RunEventType.RUN_COMPLETED)
-                    await sink.flush()
+                # Exiting the sink awaits its final flush before success is
+                # possible. The server commits status + terminal event together.
+                await self._report_usage(principal, req.run_id, usage)
+                (
                     await conv.patch(
                         f"/internal/runs/{req.run_id}", json={"status": "completed", "usage": usage.model_dump()}
                     )
-                    await self._report_usage(principal, req.run_id, usage)
-                except Exception as exc:
-                    log.exception("run %s failed", req.run_id)
-                    sink.emit(RunEventType.RUN_FAILED, error=str(exc))
-                    await sink.flush()
-                    await conv.patch(f"/internal/runs/{req.run_id}", json={"status": "failed", "error": str(exc)})
+                ).raise_for_status()
+            except Exception as exc:
+                log.exception("run %s failed", req.run_id)
+                try:
+                    (
+                        await conv.patch(f"/internal/runs/{req.run_id}", json={"status": "failed", "error": str(exc)})
+                    ).raise_for_status()
+                except Exception:
+                    # In particular, do not turn an uncertain completion into
+                    # a contradictory terminal event if its response was lost.
+                    log.exception("could not persist failure for run %s", req.run_id)
+                    raise
 
     async def _report_usage(self, principal: Principal, run_id: str, usage: Usage) -> None:
-        try:
-            async with httpx.AsyncClient(
-                base_url=self.settings.financials_url,
-                headers=principal.internal_headers(self.settings.internal_token),
-                timeout=15,
-            ) as fin:
-                (await fin.post("/usage", json={**usage.model_dump(), "run_id": run_id})).raise_for_status()
-        except Exception:
-            log.exception("usage report failed for run %s", run_id)
+        async with httpx.AsyncClient(
+            base_url=self.settings.financials_url,
+            headers={
+                **principal.internal_headers(self.settings.internal_token),
+                "X-Usage-Writer-Token": self.settings.usage_writer_token,
+            },
+            timeout=15,
+        ) as fin:
+            (await fin.post("/internal/usage", json={**usage.model_dump(), "run_id": run_id})).raise_for_status()
 
     async def _loop(self, ctx: dict[str, Any], tools: ToolBox, sink: EventSink):
         s = self.settings

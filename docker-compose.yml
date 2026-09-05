@@ -119,6 +119,7 @@ services:
     environment:
       <<: *service-env
       SERVICE_NAME: agent
+      USAGE_WRITER_TOKEN: ${USAGE_WRITER_TOKEN:-dev-usage-writer-token}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       AGENT_MODEL: ${AGENT_MODEL:-claude-opus-5}
       AGENT_EFFORT: ${AGENT_EFFORT:-medium}
@@ -133,6 +134,7 @@ services:
     environment:
       <<: *service-env
       SERVICE_NAME: financials
+      USAGE_WRITER_TOKEN: ${USAGE_WRITER_TOKEN:-dev-usage-writer-token}
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/financials
     ports: ["8004:8004"]
     depends_on: {postgres: {condition: service_healthy}}

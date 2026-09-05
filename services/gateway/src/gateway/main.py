@@ -83,7 +83,9 @@ def _forward_headers(request: Request, principal: Principal, settings: Settings)
     headers = {
         k: v
         for k, v in request.headers.items()
-        if k.lower() not in HOP_BY_HOP and not k.lower().startswith("x-dev-") and k.lower() != "authorization"
+        if k.lower() not in HOP_BY_HOP
+        and not k.lower().startswith(("x-dev-", "x-principal-"))
+        and k.lower() not in {"authorization", "x-internal-token", "x-usage-writer-token"}
     }
     headers.update(principal.internal_headers(settings.internal_token))
     return headers

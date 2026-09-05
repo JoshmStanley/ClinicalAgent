@@ -10,8 +10,9 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from secrets import compare_digest
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,7 +23,7 @@ from clinical_common.events import Usage
 from clinical_common.logging import configure_logging
 from financials.models import SCOPE_ORG, SCOPE_ROLE, SCOPE_USER, Budget, UsageRecord
 from financials.pricing import cost_usd
-from financials.settings import get_settings
+from financials.settings import Settings, get_settings
 
 db: Database | None = None
 
@@ -178,8 +179,22 @@ async def check(p: Principal = Depends(get_principal), s: AsyncSession = Depends
     return CheckOut(allowed=not blocked, reason="; ".join(blocked), budgets=statuses)
 
 
-@app.post("/usage", status_code=201)
-async def record_usage(body: UsageIn, p: Principal = Depends(get_principal), s: AsyncSession = Depends(get_session)):
+def usage_writer(
+    request: Request, settings: Settings = Depends(get_settings), p: Principal = Depends(get_principal)
+) -> Principal:
+    # This credential is provisioned only to the agent and financials services.
+    # A forwarded user principal identifies who incurred the charge; it does
+    # not grant permission to write the ledger.
+    token = request.headers.get("X-Usage-Writer-Token", "")
+    if not settings.usage_writer_token:
+        raise HTTPException(503, "Usage writer credential not configured")
+    if not compare_digest(token.encode(), settings.usage_writer_token.encode()):
+        raise HTTPException(403, "Usage writer credential required")
+    return p
+
+
+@app.post("/internal/usage", status_code=201)
+async def record_usage(body: UsageIn, p: Principal = Depends(usage_writer), s: AsyncSession = Depends(get_session)):
     cost = cost_usd(
         body.model,
         body.input_tokens,

@@ -50,6 +50,8 @@ Each service reads a `.env` in the repo root; the local defaults point at the Co
 ```bash
 make lint
 make test
+# Include Postgres integration tests (CI runs these automatically):
+TEST_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/conversations make test
 ```
 
 ## API sketch (through the gateway)

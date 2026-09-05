@@ -9,12 +9,13 @@ regardless of whether anyone is watching.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -34,6 +35,7 @@ from conversations.models import (
     Program,
     Run,
     RunEvent,
+    RunEventBatch,
     Study,
 )
 from conversations.schemas import (
@@ -492,14 +494,28 @@ async def append_events(
     events: list[RunEventIn],
     p: Principal = Depends(get_principal),
     s: AsyncSession = Depends(get_session),
+    batch_id: uuid.UUID | None = Header(None, alias="X-Event-Batch-Id"),
 ):
     run = await s.scalar(select(Run).where(Run.id == run_id).with_for_update())
     if not run or run.org_id != p.org_id:
         raise HTTPException(404, "Run not found")
+    payload_hash = hashlib.sha256(
+        json.dumps([e.model_dump(mode="json") for e in events], sort_keys=True).encode()
+    ).hexdigest()
+    if batch_id is not None:
+        receipt = await s.get(RunEventBatch, (run_id, batch_id))
+        if receipt:
+            if receipt.payload_hash != payload_hash:
+                raise HTTPException(409, "Event batch ID reused with different events")
+            return {"last_seq": receipt.last_seq}
+    if run.status in RUN_TERMINAL:
+        raise HTTPException(409, "Cannot append new events to a terminal run")
     seq = await s.scalar(select(func.coalesce(func.max(RunEvent.seq), 0)).where(RunEvent.run_id == run_id))
     for ev in events:
         seq += 1
         s.add(RunEvent(run_id=run_id, seq=seq, type=str(ev.type), payload=ev.payload))
+    if batch_id is not None:
+        s.add(RunEventBatch(run_id=run_id, batch_id=batch_id, payload_hash=payload_hash, last_seq=seq))
     await s.commit()
     return {"last_seq": seq}
 
@@ -508,13 +524,24 @@ async def append_events(
 async def patch_run(
     run_id: uuid.UUID, body: RunPatch, p: Principal = Depends(get_principal), s: AsyncSession = Depends(get_session)
 ):
-    run = await _run(s, run_id, p)
+    run = await s.scalar(select(Run).where(Run.id == run_id).with_for_update())
+    if not run or run.org_id != p.org_id:
+        raise HTTPException(404, "Run not found")
+    if run.status in RUN_TERMINAL:
+        if body.status and body.status != run.status:
+            raise HTTPException(409, "Run is already terminal")
+        return run_out(run)
     if body.status:
         run.status = body.status
         if body.status == "running" and not run.started_at:
             run.started_at = utcnow()
         if body.status in RUN_TERMINAL:
             run.finished_at = utcnow()
+            # The SSE terminal event and terminal status must agree even if
+            # the HTTP response is lost. A repeated PATCH adds no second event.
+            seq = await s.scalar(select(func.coalesce(func.max(RunEvent.seq), 0)).where(RunEvent.run_id == run_id))
+            payload = {"error": body.error} if body.status == "failed" else {}
+            s.add(RunEvent(run_id=run_id, seq=seq + 1, type=f"run.{body.status}", payload=payload))
     if body.error is not None:
         run.error = body.error
     if body.usage is not None:

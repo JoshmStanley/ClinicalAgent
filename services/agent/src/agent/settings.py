@@ -11,6 +11,7 @@ class Settings(BaseServiceSettings):
     agent_max_tokens: int = 16000
     agent_max_iterations: int = 12
     event_flush_seconds: float = 0.15
+    usage_writer_token: str = ""
 
 
 @lru_cache

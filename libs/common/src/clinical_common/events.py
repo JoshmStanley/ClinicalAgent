@@ -44,10 +44,10 @@ class RunRequested(BaseModel):
 
 class Usage(BaseModel):
     model: str
-    input_tokens: int = 0
-    output_tokens: int = 0
-    cache_read_input_tokens: int = 0
-    cache_creation_input_tokens: int = 0
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    cache_read_input_tokens: int = Field(default=0, ge=0)
+    cache_creation_input_tokens: int = Field(default=0, ge=0)
 
 
 class Citation(BaseModel):
