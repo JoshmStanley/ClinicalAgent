@@ -104,7 +104,7 @@ async def test_run_checks_persistence_before_success(monkeypatch, failure):
     executor = RunExecutor(
         Settings(anthropic_api_key="test", usage_writer_token="writer-secret", event_flush_seconds=60)
     )
-    monkeypatch.setattr(executor, "_loop", model_loop)
+    monkeypatch.setattr(executor, "run", model_loop)
     try:
         await executor.execute(
             RunRequested(run_id="run", conversation_id="conv", user_id="u", org_id="o", role="org:member")

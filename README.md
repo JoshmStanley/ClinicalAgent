@@ -4,7 +4,7 @@ A research agent for clinical development teams designing new clinical trials. U
 
 The system is a set of Python/FastAPI microservices around a Claude-powered agent, with Kafka (Redpanda) for async work, Postgres per service, OpenSearch for hybrid retrieval, and S3-compatible object storage for documents. Auth is Clerk (multi-org from the start).
 
-See [docs/architecture.md](docs/architecture.md) for the design and [docs/branching.md](docs/branching.md) for the git workflow.
+See [docs/architecture.md](docs/architecture.md) for the design, [docs/agent-orchestration.md](docs/agent-orchestration.md) for the agent graph, and [docs/branching.md](docs/branching.md) for the git workflow.
 
 ## Services
 
@@ -13,7 +13,7 @@ See [docs/architecture.md](docs/architecture.md) for the design and [docs/branch
 | `traefik` | 8000 | API gateway (Traefik Proxy, MIT). Routing, ForwardAuth to identity, per-org rate limiting, CORS, load balancing. Dashboard on `:8080` locally. |
 | `identity` | 8001 | Users, orgs, memberships, roles. Synced from Clerk webhooks. Serves `/auth/verify` for Traefik ForwardAuth. |
 | `conversations` | 8002 | Programs, studies, versioned concept sheets, conversations, runs and the run event log. Budget-gates new runs. |
-| `agent` | worker | Consumes `runs.requested`, drives the Claude tool loop, streams events, reports usage. |
+| `agent` | worker | Consumes `runs.requested`, runs a LangGraph orchestrator → parallel subagents → synthesizer graph over Claude, streams events, reports usage. See [docs/agent-orchestration.md](docs/agent-orchestration.md). |
 | `financials` | 8004 | Budgets per org / role / user and the usage ledger. |
 | `documents` | 8005 | Upload to object storage, ingestion status, hybrid BM25 + kNN search with citation metadata. |
 | `ingestion-*` | workers | `converter` → `sections` → `chunker` → `embed`, one Kafka topic per stage. |
@@ -74,4 +74,4 @@ GET  /api/usage/summary
 
 ## Status
 
-Scaffold. Working end to end locally: upload → ingest → ask → cited streamed answer, with auth and rate limiting at the edge and budgets enforced when a run is queued. Not yet built: web client, Alembic migrations, structured trial-metadata extraction at ingest time, reservation-based hard budget caps, the production ingestion pipeline described in the HLD.
+Scaffold. Working end to end locally: upload → ingest → ask → cited streamed answer, with auth and rate limiting at the edge and budgets enforced when a run is queued. The agent is a LangGraph orchestrator → subagent graph (parallel fan-out, dependencies, nested orchestrators, per-subagent event tracks); it is covered by unit tests with a fake model and has not yet been exercised against the live API. Not yet built: web client, Alembic migrations, structured trial-metadata extraction at ingest time, reservation-based hard budget caps, the production ingestion pipeline described in the HLD.

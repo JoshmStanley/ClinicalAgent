@@ -32,8 +32,10 @@ client ──GET /api/runs/{run_id}/stream──▶ traefik ──▶ conversati
 
 agent worker (Kafka consumer of runs.requested):
   PATCH run running → GET run context (history, study, concept sheet)
-  loop: Claude stream ──▶ events (text.delta, thinking.delta, tool.call, tool.result, citation, concept_sheet.updated)
-        tools: search_documents (documents /search), update_concept_sheet (conversations), ClinicalTrials.gov MCP tools
+  LangGraph: orchestrate (plan event) ──▶ subagents in parallel waves ──▶ synthesize   (docs/agent-orchestration.md)
+        each subagent: Claude stream ──▶ events tagged subagent_id (text.delta, thinking.delta, tool.call, tool.result,
+        concept_sheet.updated, subagent.started/completed); tools: search_documents (documents /search),
+        update_concept_sheet (conversations), ClinicalTrials.gov MCP tools
   POST assistant message → flush events → POST /internal/usage to financials
   → PATCH run completed + usage (atomically appends terminal event)
 ```

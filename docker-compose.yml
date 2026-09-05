@@ -138,6 +138,11 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       AGENT_MODEL: ${AGENT_MODEL:-claude-opus-5}
       AGENT_EFFORT: ${AGENT_EFFORT:-medium}
+      ORCHESTRATOR_MAX_DEPTH: ${ORCHESTRATOR_MAX_DEPTH:-2}
+      ORCHESTRATOR_MAX_SUBAGENTS: ${ORCHESTRATOR_MAX_SUBAGENTS:-5}
+      SUBAGENT_EFFORT: ${SUBAGENT_EFFORT:-low}
+      SUBAGENT_MAX_ITERATIONS: ${SUBAGENT_MAX_ITERATIONS:-8}
+      SIMPLE_MODE: ${SIMPLE_MODE:-true}
     depends_on:
       redpanda: {condition: service_healthy}
       conversations: {condition: service_started}

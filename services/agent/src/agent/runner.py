@@ -1,11 +1,10 @@
-"""Executes one run: builds context, drives the Claude tool loop, streams events."""
+"""Executes one run: builds context, runs the orchestrator graph, streams events, records usage."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-import re
 import uuid
 from contextlib import suppress
 from typing import Any
@@ -13,14 +12,16 @@ from typing import Any
 import anthropic
 import httpx
 
-from agent.prompts import SYSTEM_PROMPT
+from agent.graph import RunContext, run_orchestration
+from agent.llm import CITE_RE
 from agent.settings import Settings
 from agent.tools import ToolBox
 from clinical_common.auth import Principal
-from clinical_common.events import RunEvent, RunEventType, RunRequested, Usage
+from clinical_common.events import Citation, RunEvent, RunEventType, RunRequested, Usage
+
+__all__ = ["CITE_RE", "EventSink", "RunExecutor", "build_messages", "resolve_citations", "study_context_block"]
 
 log = logging.getLogger(__name__)
-CITE_RE = re.compile(r"\[\[chunk:([^\]\s]+)\]\]")
 
 
 class EventSink:
@@ -57,11 +58,12 @@ class EventSink:
                 log.exception("event flush failed; retaining batch for retry")
 
     def emit(self, type_: RunEventType, **payload: Any) -> None:
-        # Coalesce consecutive text/thinking deltas into one event per flush.
+        # Coalesce consecutive text/thinking deltas of the same track (same subagent) into one event per flush.
         if (
             self._buf
             and type_ in (RunEventType.TEXT_DELTA, RunEventType.THINKING_DELTA)
             and self._buf[-1].type == type_
+            and self._buf[-1].payload.get("subagent_id") == payload.get("subagent_id")
         ):
             self._buf[-1].payload["text"] += payload.get("text", "")
             return
@@ -91,13 +93,6 @@ class EventSink:
                             raise
                         await asyncio.sleep(0.1 * 2**attempt)
                 self._pending = None
-
-
-def _accumulate(total: Usage, u: Any) -> None:
-    total.input_tokens += getattr(u, "input_tokens", 0) or 0
-    total.output_tokens += getattr(u, "output_tokens", 0) or 0
-    total.cache_read_input_tokens += getattr(u, "cache_read_input_tokens", 0) or 0
-    total.cache_creation_input_tokens += getattr(u, "cache_creation_input_tokens", 0) or 0
 
 
 def build_messages(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -132,6 +127,17 @@ def study_context_block(ctx: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+def resolve_citations(text: str, tools: ToolBox, sink: Any) -> list[Citation]:
+    """Maps every [[chunk:ID]] in the final text to a Citation seen by any subagent's search, emitting each."""
+    citations: list[Citation] = []
+    for cid in dict.fromkeys(CITE_RE.findall(text)):
+        cite = tools.seen_chunks.get(cid)
+        if cite:
+            citations.append(cite)
+            sink.emit(RunEventType.CITATION, **cite.model_dump())
+    return citations
+
+
 class RunExecutor:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -148,7 +154,7 @@ class RunExecutor:
                 async with EventSink(conv, req.run_id, self.settings.event_flush_seconds) as sink:
                     sink.emit(RunEventType.RUN_STARTED, model=self.settings.agent_model)
                     async with ToolBox(self.settings, principal, study_id) as tools:
-                        text, citations, usage = await self._loop(ctx, tools, sink)
+                        text, citations, usage = await self.run(ctx, tools, sink)
                     (
                         await conv.post(
                             f"/internal/conversations/{req.conversation_id}/messages",
@@ -187,84 +193,15 @@ class RunExecutor:
         ) as fin:
             (await fin.post("/internal/usage", json={**usage.model_dump(), "run_id": run_id})).raise_for_status()
 
-    async def _loop(self, ctx: dict[str, Any], tools: ToolBox, sink: EventSink):
-        s = self.settings
-        system = [
-            {"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}},
-            {"type": "text", "text": study_context_block(ctx)},
-        ]
-        messages = build_messages(ctx["messages"])
-        usage = Usage(model=s.agent_model)
-        collected_text: list[str] = []
-
-        for _ in range(s.agent_max_iterations):
-            async with self.client.beta.messages.stream(
-                model=s.agent_model,
-                max_tokens=s.agent_max_tokens,
-                system=system,
-                messages=messages,
-                tools=tools.definitions,
-                thinking={"type": "adaptive", "display": "summarized"},
-                output_config={"effort": s.agent_effort},
-                betas=["server-side-fallback-2026-07-01"],
-                fallbacks="default",  # route safety refusals to Anthropic's recommended fallback model
-            ) as stream:
-                async for event in stream:
-                    if event.type == "content_block_delta":
-                        if event.delta.type == "text_delta":
-                            sink.emit(RunEventType.TEXT_DELTA, text=event.delta.text)
-                        elif event.delta.type == "thinking_delta" and event.delta.thinking:
-                            sink.emit(RunEventType.THINKING_DELTA, text=event.delta.thinking)
-                    elif event.type == "content_block_start" and event.content_block.type == "tool_use":
-                        sink.emit(
-                            RunEventType.TOOL_CALL, tool_use_id=event.content_block.id, name=event.content_block.name
-                        )
-                final = await stream.get_final_message()
-
-            _accumulate(usage, final.usage)
-            usage.model = final.model or usage.model
-            for block in final.content:
-                if block.type == "text":
-                    collected_text.append(block.text)
-            messages.append({"role": "assistant", "content": final.content})
-
-            if final.stop_reason == "refusal":
-                details = getattr(final, "stop_details", None)
-                raise RuntimeError(f"Model declined the request ({getattr(details, 'category', None) or 'refusal'})")
-            if final.stop_reason == "pause_turn":
-                continue
-            if final.stop_reason != "tool_use":
-                break
-
-            tool_uses = [b for b in final.content if b.type == "tool_use"]
-            results = await asyncio.gather(*(self._run_tool(tools, sink, b) for b in tool_uses))
-            messages.append({"role": "user", "content": results})
-
-        text = "\n\n".join(t for t in collected_text if t.strip())
-        citations = []
-        for cid in dict.fromkeys(CITE_RE.findall(text)):
-            cite = tools.seen_chunks.get(cid)
-            if cite:
-                citations.append(cite)
-                sink.emit(RunEventType.CITATION, **cite.model_dump())
-        return text, citations, usage
-
-    async def _run_tool(self, tools: ToolBox, sink: EventSink, block: Any) -> dict[str, Any]:
-        args = block.input if isinstance(block.input, dict) else json.loads(block.input)
-        try:
-            output, info = await tools.execute(block.name, args)
-            if "concept_sheet" in info:
-                sink.emit(RunEventType.CONCEPT_SHEET_UPDATED, version=info["concept_sheet"]["version"])
-            sink.emit(
-                RunEventType.TOOL_RESULT,
-                tool_use_id=block.id,
-                name=block.name,
-                ok=True,
-                summary=output[:500],
-                **{k: v for k, v in info.items() if k != "concept_sheet"},
-            )
-            return {"type": "tool_result", "tool_use_id": block.id, "content": output}
-        except Exception as exc:
-            log.warning("tool %s failed: %s", block.name, exc)
-            sink.emit(RunEventType.TOOL_RESULT, tool_use_id=block.id, name=block.name, ok=False, error=str(exc))
-            return {"type": "tool_result", "tool_use_id": block.id, "content": f"Tool error: {exc}", "is_error": True}
+    async def run(self, ctx: dict[str, Any], tools: ToolBox, sink: Any) -> tuple[str, list[Citation], Usage]:
+        """Runs the orchestrator graph; returns the final text, resolved citations and aggregate usage."""
+        rc = RunContext(
+            settings=self.settings,
+            client=self.client,
+            tools=tools,
+            sink=sink,
+            history=build_messages(ctx["messages"]),
+            study_block=study_context_block(ctx),
+        )
+        text = await run_orchestration(rc)
+        return text, resolve_citations(text, tools, sink), rc.usage.total
